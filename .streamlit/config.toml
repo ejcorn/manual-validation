@@ -1,0 +1,19 @@
+[browser]
+# Disable all telemetry/usage stats — required for PHI
+gatherUsageStats = false
+
+[server]
+# Bind to localhost only — never expose to network
+address = "127.0.0.1"
+port = 8501
+headless = true
+# Disable file watching (not needed for production use)
+fileWatcherType = "none"
+
+[runner]
+# Disable magic (reduces any unexpected behavior)
+magicEnabled = false
+
+[global]
+# Disable development mode features
+developmentMode = false
