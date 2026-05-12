@@ -1,6 +1,7 @@
 """
 LLM Output Validator — Streamlit App
 Manually validate LLM/NLP extracted fields against ground truth, then export for confusion matrices.
+Supports project save/resume so progress survives app restarts.
 """
 
 import streamlit as st
@@ -8,18 +9,23 @@ import pandas as pd
 import json
 import numpy as np
 from datetime import datetime
+from pathlib import Path
 import io
 import random
 
 try:
     import plotly.express as px
     import plotly.figure_factory as ff
+    import plotly.graph_objects as go
     HAS_PLOTLY = True
 except ImportError:
     HAS_PLOTLY = False
 
 try:
-    from sklearn.metrics import confusion_matrix, classification_report
+    from sklearn.metrics import (
+        confusion_matrix, classification_report,
+        accuracy_score, f1_score, cohen_kappa_score,
+    )
     HAS_SKLEARN = True
 except ImportError:
     HAS_SKLEARN = False
@@ -43,6 +49,15 @@ st.markdown("""
     font-size: 1.05em;
     margin-bottom: 8px;
 }
+.linked-gt-box {
+    padding: 10px 14px;
+    background: #d4edda;
+    border-left: 4px solid #28a745;
+    border-radius: 6px;
+    font-size: 1.1em;
+    font-weight: 600;
+    margin-bottom: 8px;
+}
 .model-box {
     padding: 14px 18px;
     background: #fff8e1;
@@ -52,10 +67,23 @@ st.markdown("""
     font-weight: 500;
     margin-bottom: 8px;
 }
+.metric-card {
+    background: #f8f9fa;
+    border-radius: 8px;
+    padding: 14px 18px;
+    margin-bottom: 8px;
+    border: 1px solid #dee2e6;
+}
+.metric-label { font-size: 0.85em; color: #666; margin-bottom: 2px; }
+.metric-value { font-size: 1.6em; font-weight: 700; color: #1a1a2e; }
 .verdict-correct   { color: #22c55e; font-weight: 700; }
 .verdict-incorrect { color: #ef4444; font-weight: 700; }
 .verdict-skipped   { color: #f59e0b; font-weight: 700; }
-.shortcut-hint     { color: #888; font-size: 0.82em; margin-top: 4px; }
+.shortcut-hint { color: #555; font-size: 0.9em; margin-top: 4px;
+                 background: #f0f0f0; padding: 6px 10px; border-radius: 4px;
+                 display: inline-block; }
+.shortcut-off  { color: #aaa; font-size: 0.9em; margin-top: 4px; font-style: italic; }
+.save-info     { font-size: 0.8em; color: #888; font-style: italic; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -63,17 +91,22 @@ st.markdown("""
 # Session state
 # ─────────────────────────────────────────────────────────────────────────────
 _DEFAULTS: dict = {
-    "page":         "setup",
-    "df":           None,
-    "project_name": "My Project",
-    "reviewer":     "reviewer1",
-    "gt_cols":      [],       # ground truth columns shown on left
-    "val_cols":     [],       # validation (model output) columns
-    "col_gt_map":   {},       # {val_col: gt_col} optional linkage
-    "mode":         "by_column",
-    "queue":        [],       # [(row_idx, col_name), ...]
-    "pos":          0,
-    "results":      {},       # {(row_idx, col_name): result_dict}
+    "page":               "setup",
+    "df":                 None,
+    "project_name":       "My Project",
+    "reviewer":           "reviewer1",
+    "save_dir":           "",          # full path to project save directory
+    "gt_cols":            [],
+    "col_gt_map":         {},          # {val_col: [gt_col, ...]}
+    "val_cols":           [],
+    "col_metric_mode":    {},          # {val_col: "categorical" | "binary"}
+    "col_positive_class": {},          # {val_col: "positive_label"}
+    "mode":               "by_column",
+    "queue":              [],          # [(row_idx, col_name), ...]
+    "pos":                0,
+    "results":            {},          # {(row_idx, col_name): result_dict}
+    "row_notes":          {},          # {str(row_id): notes_str}  — one per row
+    "kb_active":          False,
 }
 
 for k, v in _DEFAULTS.items():
@@ -83,36 +116,186 @@ for k, v in _DEFAULTS.items():
 S = st.session_state
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Keyboard shortcuts
-# Arrow keys: → correct, ← incorrect, ↑ next/forward, ↓ back
+# Keyboard shortcuts — attach to window.parent.document, not the iframe doc
 # ─────────────────────────────────────────────────────────────────────────────
-_KEYBOARD_JS = """
+
+def _keyboard_component(active: bool):
+    js = f"""
 <script>
-(function() {
-  if (window._vlKeys) return;
-  window._vlKeys = true;
-  document.addEventListener('keydown', function(e) {
-    var tag = document.activeElement ? document.activeElement.tagName : '';
-    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
-    function clickBtn(label) {
-      var btns = window.parent.document.querySelectorAll('button');
-      for (var i = 0; i < btns.length; i++) {
-        if (btns[i].innerText.trim().indexOf(label) === 0) {
+(function() {{
+  var par = window.parent;
+  if (par._vlKeyHandler) {{
+    par.document.removeEventListener('keydown', par._vlKeyHandler);
+    par._vlKeyHandler = null;
+  }}
+  if (!{'true' if active else 'false'}) return;
+  function handler(e) {{
+    var el  = par.document.activeElement;
+    var tag = el ? el.tagName : '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    function clickBtn(startsWith) {{
+      var btns = par.document.querySelectorAll('button');
+      for (var i = 0; i < btns.length; i++) {{
+        if (btns[i].innerText.trim().indexOf(startsWith) === 0) {{
           btns[i].click(); return;
-        }
-      }
-    }
-    if (e.key === 'ArrowRight') { e.preventDefault(); clickBtn('✓'); }
-    if (e.key === 'ArrowLeft')  { e.preventDefault(); clickBtn('✗'); }
-    if (e.key === 'ArrowUp')    { e.preventDefault(); clickBtn('↑ Next'); }
-    if (e.key === 'ArrowDown')  { e.preventDefault(); clickBtn('↓ Back'); }
-  });
-})();
+        }}
+      }}
+    }}
+    if (e.key === 'ArrowRight') {{ e.preventDefault(); clickBtn('✓'); }}
+    if (e.key === 'ArrowLeft')  {{ e.preventDefault(); clickBtn('✗'); }}
+    if (e.key === 'ArrowUp')    {{ e.preventDefault(); clickBtn('↑ Next'); }}
+    if (e.key === 'ArrowDown')  {{ e.preventDefault(); clickBtn('↓ Back'); }}
+  }}
+  par._vlKeyHandler = handler;
+  par.document.addEventListener('keydown', handler);
+}})();
 </script>
 """
+    st.components.v1.html(js, height=0)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Save / Load helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _json_default(obj):
+    """Serialise numpy/pandas types that json.dumps chokes on."""
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    try:
+        if pd.isna(obj):
+            return None
+    except Exception:
+        pass
+    return str(obj)
+
+
+def save_project():
+    """Persist full project state to S.save_dir.  Silently skips if no dir set."""
+    if not S.save_dir:
+        return
+    save_path = Path(S.save_dir)
+    try:
+        save_path.mkdir(parents=True, exist_ok=True)
+
+        # ── Dataframe ────────────────────────────────────────────────────────
+        if S.df is not None:
+            S.df.to_csv(save_path / "data.csv", index=True)
+
+        # ── Results: store as list of [row_id, col, dict] triples ────────────
+        results_serial = [
+            [int(row_id) if isinstance(row_id, (int, np.integer)) else row_id,
+             col,
+             {k: _json_default(v) if not isinstance(v, (str, int, float, bool, type(None))) else v
+              for k, v in res.items()}]
+            for (row_id, col), res in S.results.items()
+        ]
+
+        state = {
+            "version":            2,
+            "project_name":       S.project_name,
+            "reviewer":           S.reviewer,
+            "save_dir":           str(S.save_dir),
+            "gt_cols":            S.gt_cols,
+            "val_cols":           S.val_cols,
+            "col_gt_map":         S.col_gt_map,
+            "col_metric_mode":    S.col_metric_mode,
+            "col_positive_class": S.col_positive_class,
+            "mode":               S.mode,
+            "queue":              [[int(r) if isinstance(r, (int, np.integer)) else r, c]
+                                   for r, c in S.queue],
+            "pos":                int(S.pos),
+            "results":            results_serial,
+            "row_notes":          S.row_notes,
+            "saved_at":           datetime.now().isoformat(),
+        }
+
+        with open(save_path / "project.json", "w") as f:
+            json.dump(state, f, indent=2, default=_json_default)
+
+    except Exception as e:
+        st.warning(f"Auto-save failed: {e}")
+
+
+def load_project(save_dir: str) -> tuple[bool, str]:
+    """Load project from save_dir into session state.
+    Returns (success, message)."""
+    save_path = Path(save_dir)
+    project_file = save_path / "project.json"
+    data_file    = save_path / "data.csv"
+
+    if not project_file.exists():
+        return False, "No project.json found at that path."
+
+    try:
+        with open(project_file) as f:
+            state = json.load(f)
+
+        # Load dataframe
+        if data_file.exists():
+            df = pd.read_csv(data_file, index_col=0)
+            df.index = df.index.astype(int)
+            S.df = df
+        else:
+            return False, "data.csv not found — cannot restore dataframe."
+
+        S.project_name       = state.get("project_name", "")
+        S.reviewer           = state.get("reviewer", "reviewer1")
+        S.save_dir           = str(save_dir)
+        S.gt_cols            = state.get("gt_cols", [])
+        S.val_cols           = state.get("val_cols", [])
+        S.col_gt_map         = state.get("col_gt_map", {})
+        S.col_metric_mode    = state.get("col_metric_mode", {})
+        S.col_positive_class = state.get("col_positive_class", {})
+        S.mode               = state.get("mode", "by_column")
+        S.queue              = [tuple(q) for q in state.get("queue", [])]
+        S.pos                = state.get("pos", 0)
+        S.row_notes          = state.get("row_notes", {})
+
+        # Restore results
+        S.results = {}
+        for item in state.get("results", []):
+            row_id, col, res_dict = item
+            S.results[(int(row_id), col)] = res_dict
+
+        # Clear any stale row-notes widget state so text areas re-init from S.row_notes
+        stale = [k for k in list(st.session_state.keys()) if k.startswith("rownotes_")]
+        for k in stale:
+            del st.session_state[k]
+
+        saved_at = state.get("saved_at", "unknown")
+        total    = len(S.queue)
+        done     = sum(1 for r in S.results.values() if r.get("verdict") in ("correct", "incorrect"))
+        return True, (f"Loaded **{S.project_name}** · {done}/{total} reviewed · "
+                      f"saved {saved_at[:19].replace('T', ' ')}")
+
+    except Exception as e:
+        return False, f"Error loading project: {e}"
+
+
+def project_summary(save_dir: str) -> dict | None:
+    """Return brief metadata from a saved project without fully loading it."""
+    try:
+        with open(Path(save_dir) / "project.json") as f:
+            s = json.load(f)
+        total = len(s.get("queue", []))
+        done  = sum(1 for r in s.get("results", []) if r[2].get("verdict") in ("correct", "incorrect"))
+        return {
+            "name":     s.get("project_name", "—"),
+            "reviewer": s.get("reviewer", "—"),
+            "progress": f"{done} / {total}",
+            "saved":    s.get("saved_at", "—")[:19].replace("T", " "),
+        }
+    except Exception:
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# General helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_file(f) -> pd.DataFrame | None:
@@ -143,28 +326,55 @@ def build_queue(df: pd.DataFrame, val_cols: list[str], mode: str) -> list[tuple]
     return pairs
 
 
-def record_verdict(row_idx, col: str, verdict: str, notes: str = ""):
-    gt_col = S.col_gt_map.get(col)
-    gt_val = None
-    if gt_col and gt_col in S.df.columns:
-        gt_val = S.df.at[row_idx, gt_col]
+def _as_list(v) -> list:
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [v]
+    return list(v)
+
+
+def record_verdict(row_idx, col: str, verdict: str):
+    """Record a verdict. Notes live in S.row_notes, not per-verdict."""
+    linked_gts     = _as_list(S.col_gt_map.get(col))
+    primary_gt     = linked_gts[0] if linked_gts else None
+    primary_gt_val = (
+        S.df.at[row_idx, primary_gt]
+        if primary_gt and primary_gt in S.df.columns else None
+    )
+    all_gt = {gc: str(S.df.at[row_idx, gc]) for gc in linked_gts if gc in S.df.columns}
+
     S.results[(row_idx, col)] = {
-        "row_id":              row_idx,
-        "validation_col":      col,
-        "ground_truth_col":    gt_col,
-        "ground_truth_value":  gt_val,
-        "model_value":         S.df.at[row_idx, col],
-        "verdict":             verdict,
-        "notes":               notes,
-        "reviewer":            S.reviewer,
-        "timestamp":           datetime.now().isoformat(),
+        "row_id":             row_idx,
+        "validation_col":     col,
+        "ground_truth_col":   primary_gt,
+        "ground_truth_value": primary_gt_val,
+        "all_ground_truth":   json.dumps(all_gt) if all_gt else None,
+        "model_value":        S.df.at[row_idx, col],
+        "verdict":            verdict,
+        "reviewer":           S.reviewer,
+        "timestamp":          datetime.now().isoformat(),
     }
+
+
+def _flush_notes_and_save(row_idx):
+    """Read the text area for this row from widget state and persist."""
+    notes_key = f"rownotes_{row_idx}"
+    current   = st.session_state.get(notes_key, "")
+    if current is not None:
+        S.row_notes[str(row_idx)] = current
+    save_project()
 
 
 def results_to_df() -> pd.DataFrame:
     if not S.results:
         return pd.DataFrame()
-    return pd.DataFrame(list(S.results.values()))
+    df = pd.DataFrame(list(S.results.values()))
+    # Merge per-row notes as a single column
+    df["row_notes"] = df["row_id"].astype(str).map(
+        lambda rid: S.row_notes.get(rid, "")
+    )
+    return df
 
 
 def _render_value(label: str, val, box_class: str, key: str):
@@ -178,17 +388,196 @@ def _render_value(label: str, val, box_class: str, key: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Metrics helpers  (unchanged from previous version)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _compute_binary_metrics(y_true_raw, y_pred_raw, pos_class: str) -> dict:
+    if not HAS_SKLEARN:
+        return {}
+    try:
+        pos = str(pos_class)
+        yt  = (pd.Series(y_true_raw).astype(str) == pos).astype(int)
+        yp  = (pd.Series(y_pred_raw).astype(str) == pos).astype(int)
+        cm  = confusion_matrix(yt, yp, labels=[0, 1])
+        tn, fp, fn, tp = cm.ravel()
+        n    = len(yt)
+        sens = tp / (tp + fn)           if (tp + fn)           else float("nan")
+        spec = tn / (tn + fp)           if (tn + fp)           else float("nan")
+        prec = tp / (tp + fp)           if (tp + fp)           else float("nan")
+        f1   = (2 * prec * sens / (prec + sens)
+                if not (np.isnan(prec) or np.isnan(sens)) and (prec + sens) > 0
+                else float("nan"))
+        acc  = (tp + tn) / n            if n                   else float("nan")
+        return dict(n=n, tp=int(tp), tn=int(tn), fp=int(fp), fn=int(fn),
+                    sensitivity=sens, specificity=spec, precision=prec, f1=f1, accuracy=acc)
+    except Exception:
+        return {}
+
+
+def _compute_categorical_metrics(y_true_raw, y_pred_raw) -> dict:
+    if not HAS_SKLEARN:
+        return {}
+    try:
+        yt    = pd.Series(y_true_raw).astype(str)
+        yp    = pd.Series(y_pred_raw).astype(str)
+        acc   = accuracy_score(yt, yp)
+        kappa = cohen_kappa_score(yt, yp)
+        return dict(n=len(yt), accuracy=acc, kappa=kappa)
+    except Exception:
+        return {}
+
+
+def _render_binary_summary(m: dict, pos_class: str):
+    if not m:
+        st.info("Not enough data to compute binary metrics.")
+        return
+    c1, c2, c3, c4, c5 = st.columns(5)
+    def card(col, label, val):
+        col.markdown(
+            f'<div class="metric-card"><div class="metric-label">{label}</div>'
+            f'<div class="metric-value">{val}</div></div>',
+            unsafe_allow_html=True,
+        )
+    fmt = lambda v: f"{v:.3f}" if not np.isnan(v) else "—"
+    card(c1, "Sensitivity / Recall", fmt(m["sensitivity"]))
+    card(c2, "Specificity",          fmt(m["specificity"]))
+    card(c3, "Precision",            fmt(m["precision"]))
+    card(c4, "F1 Score",             fmt(m["f1"]))
+    card(c5, "Accuracy",             fmt(m["accuracy"]))
+    if HAS_PLOTLY:
+        neg   = f"not {pos_class}"
+        z     = [[m["tp"], m["fn"]], [m["fp"], m["tn"]]]
+        ann   = [[f"TP\n{m['tp']}", f"FN\n{m['fn']}"], [f"FP\n{m['fp']}", f"TN\n{m['tn']}"]]
+        fig   = ff.create_annotated_heatmap(
+            z=z, x=[pos_class, neg], y=[pos_class, neg],
+            annotation_text=ann,
+            colorscale=[[0, "#fff3cd"], [1, "#28a745"]], showscale=False,
+        )
+        fig.update_layout(
+            title=f"Confusion matrix  (positive = '{pos_class}',  n={m['n']})",
+            xaxis_title="Predicted", yaxis_title="Actual",
+            yaxis_autorange="reversed", height=320,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_categorical_summary(m: dict, y_true_raw, y_pred_raw):
+    if not m:
+        st.info("Not enough data to compute categorical metrics.")
+        return
+    c1, c2, c3 = st.columns(3)
+    def card(col, label, val):
+        col.markdown(
+            f'<div class="metric-card"><div class="metric-label">{label}</div>'
+            f'<div class="metric-value">{val}</div></div>',
+            unsafe_allow_html=True,
+        )
+    card(c1, "Accuracy",      f"{m['accuracy']:.3f}")
+    card(c2, "Cohen's Kappa", f"{m['kappa']:.3f}")
+    card(c3, "n reviewed",    str(m["n"]))
+    _render_confusion_matrix_raw(y_true_raw, y_pred_raw, f"n={m['n']}")
+
+
+def _render_confusion_matrix_raw(y_true_raw, y_pred_raw, title_suffix=""):
+    if not (HAS_SKLEARN and HAS_PLOTLY):
+        st.dataframe(pd.crosstab(
+            pd.Series(y_true_raw).astype(str),
+            pd.Series(y_pred_raw).astype(str),
+        ), use_container_width=True)
+        return
+    yt     = pd.Series(y_true_raw).astype(str)
+    yp     = pd.Series(y_pred_raw).astype(str)
+    labels = sorted(set(yt) | set(yp))
+    normalize = st.checkbox("Normalize rows", value=False,
+                            key=f"norm_{'_'.join(labels[:3])}_{len(labels)}")
+    cm = confusion_matrix(yt, yp, labels=labels)
+    if normalize:
+        cm_d = cm.astype(float) / cm.sum(axis=1, keepdims=True)
+        cm_d = np.nan_to_num(cm_d)
+        ann  = [[f"{v:.2f}" for v in r] for r in cm_d]
+    else:
+        cm_d = cm.astype(float)
+        ann  = [[str(v) for v in r] for r in cm]
+    fig = ff.create_annotated_heatmap(
+        z=cm_d, x=labels, y=labels, annotation_text=ann,
+        colorscale="Blues", showscale=True,
+    )
+    fig.update_layout(
+        title=f"Confusion matrix  {title_suffix}",
+        xaxis_title="Predicted", yaxis_title="Actual",
+        yaxis_autorange="reversed", height=max(350, 80 * len(labels)),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    with st.expander("Classification report"):
+        st.code(classification_report(yt, yp, labels=labels, zero_division=0))
+
+
+def _render_confusion_matrix(df: pd.DataFrame, val_col: str, gt_col: str):
+    subset = df[[gt_col, val_col]].dropna()
+    if subset.empty:
+        st.info("No data available.")
+        return
+    mode      = S.col_metric_mode.get(val_col, "categorical")
+    pos_class = S.col_positive_class.get(val_col, "True")
+    if mode == "binary":
+        m = _compute_binary_metrics(subset[gt_col], subset[val_col], pos_class)
+        _render_binary_summary(m, pos_class)
+    else:
+        m = _compute_categorical_metrics(subset[gt_col], subset[val_col])
+        _render_categorical_summary(m, subset[gt_col], subset[val_col])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Page: Setup
 # ─────────────────────────────────────────────────────────────────────────────
 
 def page_setup():
-    st.title("LLM Output Validator — Project Setup")
+    st.title("LLM Output Validator")
+
+    # ── Resume existing project ──────────────────────────────────────────────
+    st.subheader("Resume a saved project")
+    resume_input = st.text_input(
+        "Path to existing project directory",
+        placeholder="/Users/you/projects/my-validation",
+        key="resume_path_input",
+    )
+    if resume_input:
+        summary = project_summary(resume_input)
+        if summary:
+            rc1, rc2, rc3, rc4 = st.columns(4)
+            rc1.metric("Project",  summary["name"])
+            rc2.metric("Reviewer", summary["reviewer"])
+            rc3.metric("Progress", summary["progress"])
+            rc4.metric("Last saved", summary["saved"])
+            if st.button("▶ Resume this project", type="primary"):
+                ok, msg = load_project(resume_input)
+                if ok:
+                    st.success(msg)
+                    S.page = "validate"
+                    st.rerun()
+                else:
+                    st.error(msg)
+        else:
+            st.warning("No valid project found at that path.")
+
+    st.divider()
+
+    # ── New project ──────────────────────────────────────────────────────────
+    st.subheader("Configure a new project")
 
     c1, c2 = st.columns(2)
     with c1:
         S.project_name = st.text_input("Project name", value=S.project_name)
     with c2:
         S.reviewer = st.text_input("Reviewer ID", value=S.reviewer)
+
+    save_dir_input = st.text_input(
+        "Save directory (full path — created if it doesn't exist)",
+        value=S.save_dir,
+        placeholder="/Users/you/projects/my-validation",
+        help="Project state is auto-saved here after every verdict so you can resume later.",
+    )
+    S.save_dir = save_dir_input
 
     uploaded = st.file_uploader(
         "Upload dataframe (CSV, JSON, JSONL, XLSX)",
@@ -202,42 +591,79 @@ def page_setup():
             st.success(f"Loaded {len(df):,} rows × {len(df.columns)} columns")
 
     if S.df is None:
-        st.info("Upload a file to configure the project.")
+        st.info("Upload a file to continue.")
         return
 
-    df = S.df
+    df   = S.df
     cols = list(df.columns)
 
     st.subheader("Preview (first 5 rows)")
     st.dataframe(df.head(5), use_container_width=True)
 
+    # ── Column roles ────────────────────────────────────────────────────────
     st.subheader("Column Roles")
-    st.caption(
-        "**Ground truth** = correct/gold values shown on the left. "
-        "**Validation** = model outputs to verify, shown on the right one at a time."
-    )
     cc1, cc2 = st.columns(2)
     with cc1:
         gt = st.multiselect("Ground truth columns (left panel)", cols, default=S.gt_cols)
     with cc2:
         val = st.multiselect("Validation columns (model outputs)", cols, default=S.val_cols)
 
+    # ── GT linkage ───────────────────────────────────────────────────────────
     if val and gt:
-        st.subheader("Link each validation column to its ground truth (optional)")
-        st.caption("Required for confusion matrices.")
-        mapping = {}
-        n = min(len(val), 4)
-        row_cols = st.columns(n)
+        st.subheader("Link validation columns → ground truth")
+        st.caption("Linked columns are highlighted during review. First linked = primary for metrics.")
+        mapping: dict[str, list[str]] = {}
+        link_cols = st.columns(min(len(val), 3))
         for i, vc in enumerate(val):
-            with row_cols[i % n]:
-                default_gt = S.col_gt_map.get(vc, "(none)")
-                opts = ["(none)"] + gt
-                idx = opts.index(default_gt) if default_gt in opts else 0
-                chosen = st.selectbox(f"`{vc}` ←→", opts, index=idx, key=f"gtmap_{vc}")
-                if chosen != "(none)":
+            with link_cols[i % len(link_cols)]:
+                prev   = _as_list(S.col_gt_map.get(vc))
+                chosen = st.multiselect(
+                    f"`{vc}`", options=gt,
+                    default=[c for c in prev if c in gt],
+                    key=f"gtmap_{vc}",
+                )
+                if chosen:
                     mapping[vc] = chosen
         S.col_gt_map = mapping
 
+    # ── Metric type ──────────────────────────────────────────────────────────
+    if val:
+        st.subheader("Metric type per validation column")
+        st.caption(
+            "**Categorical** → accuracy + Cohen's κ + confusion matrix.  "
+            "**Binary** → sensitivity, specificity, precision, recall, F1."
+        )
+        metric_modes:     dict[str, str] = {}
+        positive_classes: dict[str, str] = {}
+        for vc in val:
+            mc1, mc2, mc3 = st.columns([2, 2, 2])
+            with mc1:
+                st.markdown(f"**`{vc}`**")
+            with mc2:
+                cur = S.col_metric_mode.get(vc, "categorical")
+                choice = st.radio(
+                    "type", ["categorical", "binary"],
+                    format_func=lambda x: "Categorical" if x == "categorical" else "Binary",
+                    horizontal=True,
+                    index=0 if cur == "categorical" else 1,
+                    key=f"mmode_{vc}",
+                    label_visibility="collapsed",
+                )
+                metric_modes[vc] = choice
+            with mc3:
+                if choice == "binary":
+                    pos = st.text_input(
+                        "Positive class label",
+                        value=S.col_positive_class.get(vc, "True"),
+                        key=f"posclass_{vc}",
+                    )
+                    positive_classes[vc] = pos
+                else:
+                    st.caption("N/A")
+        S.col_metric_mode    = metric_modes
+        S.col_positive_class = positive_classes
+
+    # ── Validation options ───────────────────────────────────────────────────
     st.subheader("Validation Options")
     oc1, oc2 = st.columns(2)
     with oc1:
@@ -258,6 +684,9 @@ def page_setup():
         if not val:
             st.error("Select at least one validation column.")
             return
+        if not S.save_dir:
+            st.error("Please enter a save directory — required for auto-save.")
+            return
         S.gt_cols  = gt
         S.val_cols = val
         S.mode     = mode
@@ -265,18 +694,24 @@ def page_setup():
         if sample_n > 0:
             working_df = df.sample(n=int(sample_n), random_state=42).reset_index(drop=True)
             S.df = working_df
-        S.queue = build_queue(S.df, val, mode)
-        S.pos   = 0
-        S.page  = "validate"
+        S.queue     = build_queue(S.df, val, mode)
+        S.pos       = 0
+        S.row_notes = {}
+        S.results   = {}
+        save_project()   # initial save
+        S.page = "validate"
         st.rerun()
 
-    # Quick confusion matrix without any manual validation
-    if S.col_gt_map:
+    # ── Quick confusion matrix ────────────────────────────────────────────────
+    cols_with_gt = [vc for vc, gts in S.col_gt_map.items() if gts]
+    if cols_with_gt:
         st.markdown("---")
-        st.subheader("Quick Confusion Matrix (full dataset, no manual validation)")
-        qcm_col = st.selectbox("Column", list(S.col_gt_map.keys()), key="qcm_col")
-        if st.button("Generate"):
-            _render_confusion_matrix(S.df, qcm_col, S.col_gt_map[qcm_col])
+        st.subheader("Quick Confusion Matrix (full dataset)")
+        qcm_val = st.selectbox("Validation column", cols_with_gt, key="qcm_val")
+        linked  = _as_list(S.col_gt_map.get(qcm_val))
+        qcm_gt  = st.selectbox("Ground truth column", linked, key="qcm_gt")
+        if st.button("Generate", key="qcm_btn"):
+            _render_confusion_matrix(S.df, qcm_val, qcm_gt)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -288,22 +723,31 @@ def page_validate():
     total = len(queue)
 
     if not queue:
-        st.error("Queue is empty. Go back to setup.")
+        st.error("Queue is empty — go back to Setup.")
         if st.button("← Setup"):
             S.page = "setup"
             st.rerun()
         return
 
-    # Sidebar
+    # ── Sidebar ──────────────────────────────────────────────────────────────
     with st.sidebar:
         st.markdown(f"### {S.project_name}")
         st.markdown(f"**Reviewer:** {S.reviewer}  \n**Mode:** {S.mode}")
+        if S.save_dir:
+            st.markdown(f'<div class="save-info">💾 {S.save_dir}</div>', unsafe_allow_html=True)
         st.markdown("---")
+
+        safe_pos = min(S.pos + 1, total)
         jump = st.number_input("Jump to item #", min_value=1, max_value=total,
-                               value=S.pos + 1, step=1)
+                               value=safe_pos, step=1)
         if st.button("Go", key="jump_btn"):
             S.pos = int(jump) - 1
             st.rerun()
+
+        if st.button("💾 Save now", use_container_width=True):
+            save_project()
+            st.success("Saved.")
+
         st.markdown("---")
         if st.button("📊 View Results", use_container_width=True):
             S.page = "results"
@@ -311,6 +755,7 @@ def page_validate():
         if st.button("⚙ Setup", use_container_width=True):
             S.page = "setup"
             st.rerun()
+
         if S.results:
             st.markdown("---\n**Progress by column:**")
             for vc in S.val_cols:
@@ -319,11 +764,12 @@ def page_validate():
                 done    = len(col_r)
                 correct = sum(1 for r in col_r if r["verdict"] == "correct")
                 acc     = f"{correct/done:.0%}" if done else "—"
-                st.markdown(f"**{vc}**: {done}/{n_col} · {acc}")
+                badge   = "🔵" if S.col_metric_mode.get(vc, "categorical") == "categorical" else "🟢"
+                st.markdown(f"{badge} **{vc}**: {done}/{n_col} · {acc}")
 
     pos = S.pos
 
-    # Header
+    # ── Header ───────────────────────────────────────────────────────────────
     h1, h2 = st.columns([3, 1])
     with h1:
         st.title(f"Validating: {S.project_name}")
@@ -341,77 +787,96 @@ def page_validate():
         if st.button("📊 View Results", type="primary"):
             S.page = "results"
             st.rerun()
+        _keyboard_component(False)
         return
 
     row_idx, col_name = queue[pos]
-    row      = S.df.loc[row_idx]
-    existing = S.results.get((row_idx, col_name))
+    row         = S.df.loc[row_idx]
+    existing    = S.results.get((row_idx, col_name))
+    linked_gts  = _as_list(S.col_gt_map.get(col_name))
+    metric_mode = S.col_metric_mode.get(col_name, "categorical")
+    pos_class   = S.col_positive_class.get(col_name, "True")
+
+    # ── Notes widget — one per row, shared across all columns ────────────────
+    # Pre-init from S.row_notes so loaded projects show correctly
+    notes_key = f"rownotes_{row_idx}"
+    if notes_key not in st.session_state:
+        st.session_state[notes_key] = S.row_notes.get(str(row_idx), "")
 
     left, right = st.columns([1, 1], gap="large")
 
     # ── Left: ground truth ───────────────────────────────────────────────────
     with left:
         st.markdown("### Ground Truth")
-
-        linked_gt = S.col_gt_map.get(col_name)
-
-        # Show all GT columns
         for c in S.gt_cols:
-            # Highlight the linked GT column more prominently
-            box = "model-box" if c == linked_gt else "gt-box"
+            is_linked = c in linked_gts
             _render_value(
-                f"{c} {'← linked' if c == linked_gt else ''}",
-                row.get(c, "—"), box, f"gt_{c}_{pos}"
+                f"{c}  ✦ compare" if is_linked else c,
+                row.get(c, "—"),
+                "linked-gt-box" if is_linked else "gt-box",
+                f"gt_{c}_{pos}",
             )
-
-        # If linked GT isn't in the selected gt_cols, show it anyway
-        if linked_gt and linked_gt not in S.gt_cols:
-            st.markdown("---")
-            _render_value(f"{linked_gt} (linked GT)", row.get(linked_gt, "—"),
-                          "model-box", f"lgt_{pos}")
-
+        for gc in [g for g in linked_gts if g not in S.gt_cols]:
+            _render_value(f"{gc}  ✦ compare", row.get(gc, "—"),
+                          "linked-gt-box", f"lgt_{gc}_{pos}")
         st.caption(f"Row {row_idx}")
 
     # ── Right: model output + verdict ────────────────────────────────────────
     with right:
-        st.markdown(f"### Model Output — `{col_name}`")
+        badge_html = (
+            f'<span style="background:#d4edda;color:#155724;padding:2px 8px;'
+            f'border-radius:4px;font-size:0.8em;font-weight:600;">BINARY · pos="{pos_class}"</span>'
+            if metric_mode == "binary" else
+            f'<span style="background:#cce5ff;color:#004085;padding:2px 8px;'
+            f'border-radius:4px;font-size:0.8em;font-weight:600;">CATEGORICAL</span>'
+        )
+        st.markdown(f"### Model Output — `{col_name}` &nbsp; {badge_html}",
+                    unsafe_allow_html=True)
 
-        model_val = row.get(col_name, "—")
-        _render_value("Model output", model_val, "model-box", f"mv_{pos}")
-
+        _render_value("Model output", row.get(col_name, "—"), "model-box", f"mv_{pos}")
         st.markdown("---")
 
-        st.markdown(
-            '<div class="shortcut-hint">'
-            '→ correct &nbsp;|&nbsp; ← incorrect &nbsp;|&nbsp; ↑ next &nbsp;|&nbsp; ↓ back'
-            '</div>',
-            unsafe_allow_html=True,
-        )
+        # Keyboard toggle
+        kb_col, hint_col = st.columns([1, 3])
+        with kb_col:
+            if st.button("⌨ Keys ON" if S.kb_active else "⌨ Keys OFF",
+                         key=f"kb_toggle_{pos}"):
+                S.kb_active = not S.kb_active
+                st.rerun()
+        with hint_col:
+            if S.kb_active:
+                st.markdown(
+                    '<span class="shortcut-hint">'
+                    '→ correct &nbsp;|&nbsp; ← incorrect &nbsp;|&nbsp; ↑ next &nbsp;|&nbsp; ↓ back'
+                    '</span>', unsafe_allow_html=True)
+            else:
+                st.markdown('<span class="shortcut-off">keyboard shortcuts off</span>',
+                            unsafe_allow_html=True)
 
-        notes = st.text_input(
-            "Notes (optional)",
-            value=existing.get("notes", "") if existing else "",
-            placeholder="Corrections, observations…",
-            key=f"notes_{pos}",
-        )
-
+        # Verdict buttons
         bc1, bc2, bc3, bc4 = st.columns(4)
         with bc1:
             if st.button("✓ Correct", type="primary", key=f"yes_{pos}", use_container_width=True):
-                record_verdict(row_idx, col_name, "correct", notes)
+                _flush_notes_and_save(row_idx)
+                record_verdict(row_idx, col_name, "correct")
+                save_project()
                 S.pos = min(pos + 1, total)
                 st.rerun()
         with bc2:
             if st.button("✗ Incorrect", key=f"no_{pos}", use_container_width=True):
-                record_verdict(row_idx, col_name, "incorrect", notes)
+                _flush_notes_and_save(row_idx)
+                record_verdict(row_idx, col_name, "incorrect")
+                save_project()
                 S.pos = min(pos + 1, total)
                 st.rerun()
         with bc3:
             if st.button("↑ Next", key=f"next_{pos}", use_container_width=True):
+                _flush_notes_and_save(row_idx)
                 S.pos = min(pos + 1, total)
                 st.rerun()
         with bc4:
             if st.button("↓ Back", key=f"back_{pos}", use_container_width=True):
+                _flush_notes_and_save(row_idx)
                 S.pos = max(pos - 1, 0)
                 st.rerun()
 
@@ -422,100 +887,81 @@ def page_validate():
             st.markdown(f'<div class="{cls}">Previously: {v.upper()}</div>',
                         unsafe_allow_html=True)
 
-    st.components.v1.html(_KEYBOARD_JS, height=0)
+    # ── Row notes — rendered full-width below both panels ────────────────────
+    st.markdown("---")
+    st.text_area(
+        f"📝 Notes for row {row_idx}  *(shared across all columns — appends as you add more)*",
+        key=notes_key,
+        height=90,
+        placeholder="Any observations, corrections, or flags for this row…",
+    )
+
+    _keyboard_component(S.kb_active)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Confusion matrix renderer (shared by setup quick-plot and results page)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _render_confusion_matrix(df: pd.DataFrame, val_col: str, gt_col: str, filter_mask=None):
-    subset = df.copy()
-    if filter_mask is not None:
-        subset = subset[filter_mask]
-    subset = subset[[gt_col, val_col]].dropna()
-    if subset.empty:
-        st.info("No data available.")
-        return
-
-    y_true = subset[gt_col].astype(str)
-    y_pred = subset[val_col].astype(str)
-    labels = sorted(set(y_true) | set(y_pred))
-
-    if HAS_SKLEARN and HAS_PLOTLY:
-        normalize = st.checkbox("Normalize rows", value=False, key=f"norm_{val_col}_{gt_col}")
-        cm = confusion_matrix(y_true, y_pred, labels=labels)
-        if normalize:
-            cm_disp = cm.astype(float) / cm.sum(axis=1, keepdims=True)
-            cm_disp = np.nan_to_num(cm_disp)
-            ann = [[f"{v:.2f}" for v in r] for r in cm_disp]
-        else:
-            cm_disp = cm.astype(float)
-            ann     = [[str(v) for v in r] for r in cm]
-
-        fig = ff.create_annotated_heatmap(
-            z=cm_disp, x=labels, y=labels,
-            annotation_text=ann, colorscale="Blues", showscale=True,
-        )
-        fig.update_layout(
-            title=f"{val_col} vs {gt_col}  (n={len(subset)})",
-            xaxis_title=f"Predicted — {val_col}",
-            yaxis_title=f"Actual — {gt_col}",
-            yaxis_autorange="reversed",
-            height=max(350, 80 * len(labels)),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        with st.expander("Classification report"):
-            st.code(classification_report(y_true, y_pred, labels=labels, zero_division=0))
-    else:
-        st.dataframe(
-            pd.crosstab(y_true, y_pred, rownames=[gt_col], colnames=[val_col]),
-            use_container_width=True,
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Page: Results
+# Page: Results  (unchanged structure, updated notebook snippet)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def page_results():
     st.title(f"Results — {S.project_name}")
-
     results_df = results_to_df()
 
-    tab_summary, tab_cm, tab_raw = st.tabs(["Summary & Export", "Confusion Matrices", "Raw Data"])
+    tab_summary, tab_metrics, tab_cm, tab_raw = st.tabs(
+        ["Summary & Export", "Metrics by Column", "Confusion Matrices", "Raw Data"]
+    )
 
     with tab_summary:
         if results_df.empty:
             st.info("No results yet.")
         else:
-            total    = len(results_df)
-            correct  = (results_df.verdict == "correct").sum()
-            incorrect= (results_df.verdict == "incorrect").sum()
-            skipped  = (results_df.verdict == "skipped").sum()
-            reviewed = correct + incorrect
+            total     = len(results_df)
+            correct   = (results_df.verdict == "correct").sum()
+            incorrect = (results_df.verdict == "incorrect").sum()
+            skipped   = (results_df.verdict == "skipped").sum()
+            reviewed  = correct + incorrect
 
             m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("Reviewed", total)
-            m2.metric("Correct",  correct)
-            m3.metric("Incorrect",incorrect)
-            m4.metric("Skipped",  skipped)
-            m5.metric("Accuracy", f"{correct/reviewed:.1%}" if reviewed else "—")
+            m1.metric("Reviewed",  total)
+            m2.metric("Correct",   correct)
+            m3.metric("Incorrect", incorrect)
+            m4.metric("Skipped",   skipped)
+            m5.metric("Accuracy",  f"{correct/reviewed:.1%}" if reviewed else "—")
 
             st.subheader("By Column")
-            by_col = (
-                results_df.groupby("validation_col")
-                .apply(lambda g: pd.Series({
-                    "reviewed":  (g.verdict != "skipped").sum(),
-                    "correct":   (g.verdict == "correct").sum(),
-                    "incorrect": (g.verdict == "incorrect").sum(),
-                    "skipped":   (g.verdict == "skipped").sum(),
-                    "accuracy":  f"{(g.verdict=='correct').sum() / max((g.verdict!='skipped').sum(),1):.1%}",
-                }), include_groups=False)
-                .reset_index()
-            )
-            st.dataframe(by_col, use_container_width=True)
+            rows_sum = []
+            for vc in S.val_cols:
+                g    = results_df[results_df.validation_col == vc]
+                mode = S.col_metric_mode.get(vc, "categorical")
+                row  = {
+                    "column":      vc,
+                    "metric_type": mode,
+                    "reviewed":    (g.verdict != "skipped").sum(),
+                    "correct":     (g.verdict == "correct").sum(),
+                    "incorrect":   (g.verdict == "incorrect").sum(),
+                    "skipped":     (g.verdict == "skipped").sum(),
+                }
+                n_rev = row["reviewed"]
+                row["accuracy"] = f"{row['correct']/n_rev:.1%}" if n_rev else "—"
+                if n_rev and S.col_gt_map.get(vc):
+                    sub = results_df[
+                        (results_df.validation_col == vc) &
+                        (results_df.verdict != "skipped") &
+                        results_df.ground_truth_value.notna() &
+                        results_df.model_value.notna()
+                    ]
+                    if mode == "binary":
+                        bm = _compute_binary_metrics(
+                            sub.ground_truth_value, sub.model_value,
+                            S.col_positive_class.get(vc, "True"))
+                        row["sensitivity"] = f"{bm.get('sensitivity', float('nan')):.3f}"
+                        row["specificity"] = f"{bm.get('specificity', float('nan')):.3f}"
+                        row["F1"]          = f"{bm.get('f1', float('nan')):.3f}"
+                    else:
+                        cm = _compute_categorical_metrics(sub.ground_truth_value, sub.model_value)
+                        row["kappa"] = f"{cm.get('kappa', float('nan')):.3f}"
+                rows_sum.append(row)
+            st.dataframe(pd.DataFrame(rows_sum), use_container_width=True)
 
             if HAS_PLOTLY:
                 counts = (
@@ -523,71 +969,116 @@ def page_results():
                     .groupby(["validation_col", "verdict"]).size()
                     .reset_index(name="count")
                 )
-                fig = px.bar(
-                    counts, x="validation_col", y="count", color="verdict", barmode="group",
-                    color_discrete_map={"correct": "#22c55e", "incorrect": "#ef4444"},
-                    title="Correct vs Incorrect by Column",
-                )
+                fig = px.bar(counts, x="validation_col", y="count", color="verdict",
+                             barmode="group",
+                             color_discrete_map={"correct": "#22c55e", "incorrect": "#ef4444"},
+                             title="Correct vs Incorrect by Column")
                 st.plotly_chart(fig, use_container_width=True)
 
             st.subheader("Export")
             dl1, dl2 = st.columns(2)
+            fname = S.project_name.replace(" ", "_")
             with dl1:
                 buf = io.StringIO()
                 results_df.to_csv(buf, index=False)
-                st.download_button(
-                    "⬇ Download CSV",
-                    data=buf.getvalue(),
-                    file_name=f"{S.project_name.replace(' ','_')}_validation.csv",
-                    mime="text/csv",
-                )
+                st.download_button("⬇ Download CSV", data=buf.getvalue(),
+                                   file_name=f"{fname}_validation.csv", mime="text/csv")
             with dl2:
-                st.download_button(
-                    "⬇ Download JSON",
-                    data=results_df.to_json(orient="records", indent=2),
-                    file_name=f"{S.project_name.replace(' ','_')}_validation.json",
-                    mime="application/json",
-                )
+                st.download_button("⬇ Download JSON",
+                                   data=results_df.to_json(orient="records", indent=2),
+                                   file_name=f"{fname}_validation.json",
+                                   mime="application/json")
 
             st.subheader("Loading in a notebook")
             st.code(
                 'import pandas as pd\n'
+                'from sklearn.metrics import confusion_matrix, cohen_kappa_score, classification_report\n'
                 'df = pd.read_csv("..._validation.csv")\n\n'
-                '# Confusion matrix for one column\n'
-                'col = df[df.validation_col == "model_rec_code"]\n'
-                'from sklearn.metrics import confusion_matrix\n'
-                'cm = confusion_matrix(col.ground_truth_value, col.model_value)',
+                '# --- Categorical column ---\n'
+                'col = df[(df.validation_col=="model_rec_code") & (df.verdict!="skipped")]\n'
+                'print(cohen_kappa_score(col.ground_truth_value, col.model_value))\n\n'
+                '# --- Binary column ---\n'
+                'col = df[(df.validation_col=="model_finding_present") & (df.verdict!="skipped")]\n'
+                'y_true = (col.ground_truth_value == "True").astype(int)\n'
+                'y_pred = (col.model_value        == "True").astype(int)\n'
+                'print(classification_report(y_true, y_pred))\n\n'
+                '# --- Row-level notes ---\n'
+                'notes = df[["row_id","row_notes"]].drop_duplicates()',
                 language="python",
             )
 
+    with tab_metrics:
+        st.subheader("Detailed Metrics by Column")
+        cols_with_gt = [vc for vc, gts in S.col_gt_map.items() if gts]
+        if not cols_with_gt:
+            st.info("Link validation columns to ground truth in Setup.")
+        elif results_df.empty:
+            st.info("No results yet.")
+        else:
+            sel       = st.selectbox("Select column", cols_with_gt, key="metrics_sel")
+            mode      = S.col_metric_mode.get(sel, "categorical")
+            pos_class = S.col_positive_class.get(sel, "True")
+            sub = results_df[
+                (results_df.validation_col == sel) &
+                (results_df.verdict != "skipped") &
+                results_df.ground_truth_value.notna() &
+                results_df.model_value.notna()
+            ]
+            if sub.empty:
+                st.info("No reviewed rows with GT values for this column.")
+            else:
+                st.markdown(
+                    f"**Mode:** {'Binary  (positive = `' + pos_class + '`)' if mode == 'binary' else 'Categorical'}"
+                    f"  ·  **n = {len(sub)}**"
+                )
+                if mode == "binary":
+                    m = _compute_binary_metrics(sub.ground_truth_value, sub.model_value, pos_class)
+                    _render_binary_summary(m, pos_class)
+                else:
+                    m = _compute_categorical_metrics(sub.ground_truth_value, sub.model_value)
+                    _render_categorical_summary(m, sub.ground_truth_value, sub.model_value)
+
     with tab_cm:
         st.subheader("Confusion Matrix Generator")
-
-        cols_with_gt = [vc for vc in S.val_cols if S.col_gt_map.get(vc)]
+        cols_with_gt = [vc for vc, gts in S.col_gt_map.items() if gts]
         if not cols_with_gt:
-            st.info("No ground truth links configured. Set them up in the Setup page.")
+            st.info("No ground truth links configured.")
         else:
             st.markdown("#### From validated rows only")
-            sel = st.selectbox("Column", cols_with_gt, key="cm_reviewed")
+            sel_r    = st.selectbox("Validation column", cols_with_gt, key="cm_rev_val")
+            linked_r = _as_list(S.col_gt_map.get(sel_r))
+            gt_sel_r = st.selectbox("Ground truth column", linked_r, key="cm_rev_gt")
             if not results_df.empty:
-                col_r = results_df[
-                    (results_df.validation_col == sel) & (results_df.verdict != "skipped")
+                sub_r = results_df[
+                    (results_df.validation_col == sel_r) &
+                    (results_df.verdict != "skipped")
                 ].copy()
-                if col_r.empty:
-                    st.info("No reviewed rows for this column yet.")
+                primary_gt = (_as_list(S.col_gt_map.get(sel_r)) or [None])[0]
+                if gt_sel_r != primary_gt:
+                    sub_r["ground_truth_value"] = S.df.loc[sub_r["row_id"].tolist(), gt_sel_r].values
+                sub_r = sub_r.dropna(subset=["ground_truth_value", "model_value"])
+                if sub_r.empty:
+                    st.info("No reviewed rows yet.")
                 else:
-                    tmp = col_r.rename(columns={
-                        "ground_truth_value": "__gt__", "model_value": "__pred__"
-                    })
-                    _render_confusion_matrix(tmp, "__pred__", "__gt__")
+                    mode_r = S.col_metric_mode.get(sel_r, "categorical")
+                    pos_r  = S.col_positive_class.get(sel_r, "True")
+                    if mode_r == "binary":
+                        m = _compute_binary_metrics(sub_r.ground_truth_value,
+                                                    sub_r.model_value, pos_r)
+                        _render_binary_summary(m, pos_r)
+                    else:
+                        _render_confusion_matrix_raw(sub_r.ground_truth_value,
+                                                     sub_r.model_value, f"n={len(sub_r)}")
             else:
-                st.info("No validation results yet.")
+                st.info("No results yet.")
 
             st.markdown("---")
             st.markdown("#### From full dataset (all rows)")
-            sel2 = st.selectbox("Column", cols_with_gt, key="cm_full")
+            sel2    = st.selectbox("Validation column", cols_with_gt, key="cm_full_val")
+            linked2 = _as_list(S.col_gt_map.get(sel2))
+            gt2     = st.selectbox("Ground truth column", linked2, key="cm_full_gt")
             if sel2 and S.df is not None:
-                _render_confusion_matrix(S.df, sel2, S.col_gt_map[sel2])
+                _render_confusion_matrix(S.df, sel2, gt2)
 
     with tab_raw:
         if results_df.empty:
