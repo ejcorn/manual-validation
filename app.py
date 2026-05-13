@@ -12,6 +12,9 @@ from datetime import datetime
 from pathlib import Path
 import io
 import random
+import re
+import html as _html
+from difflib import SequenceMatcher
 
 try:
     import plotly.express as px
@@ -58,6 +61,15 @@ st.markdown("""
     font-weight: 600;
     margin-bottom: 8px;
 }
+.explore-box {
+    padding: 8px 12px;
+    background: #f8f9fa;
+    border-left: 4px solid #6c757d;
+    border-radius: 6px;
+    font-size: 0.98em;
+    margin-bottom: 6px;
+    white-space: pre-wrap;
+}
 .model-box {
     padding: 14px 18px;
     background: #fff8e1;
@@ -99,6 +111,8 @@ _DEFAULTS: dict = {
     "gt_cols":            [],
     "col_gt_map":         {},          # {val_col: [gt_col, ...]}
     "val_cols":           [],
+    "explore_cols":       [],          # extra columns togglable on left panel
+    "explore_visible":    False,       # whether explore panel is currently open
     "col_metric_mode":    {},          # {val_col: "categorical" | "binary"}
     "col_positive_class": {},          # {val_col: "positive_label"}
     "mode":               "by_column",
@@ -202,6 +216,7 @@ def save_project():
             "save_dir":           str(S.save_dir),
             "gt_cols":            S.gt_cols,
             "val_cols":           S.val_cols,
+            "explore_cols":       S.explore_cols,
             "col_gt_map":         S.col_gt_map,
             "col_metric_mode":    S.col_metric_mode,
             "col_positive_class": S.col_positive_class,
@@ -248,6 +263,7 @@ def load_project(save_dir: str) -> tuple[bool, str]:
         S.save_dir           = str(save_dir)
         S.gt_cols            = state.get("gt_cols", [])
         S.val_cols           = state.get("val_cols", [])
+        S.explore_cols       = state.get("explore_cols", [])
         S.col_gt_map         = state.get("col_gt_map", {})
         S.col_metric_mode    = state.get("col_metric_mode", {})
         S.col_positive_class = state.get("col_positive_class", {})
@@ -367,6 +383,7 @@ def _flush_notes_and_save(row_idx):
 
 
 def results_to_df() -> pd.DataFrame:
+    """Full internal results dataframe — includes GT/model values for in-app metrics."""
     if not S.results:
         return pd.DataFrame()
     df = pd.DataFrame(list(S.results.values()))
@@ -377,14 +394,114 @@ def results_to_df() -> pd.DataFrame:
     return df
 
 
-def _render_value(label: str, val, box_class: str, key: str):
+def results_to_export_df() -> pd.DataFrame:
+    """Minimal export dataframe — only what's needed to compute metrics externally.
+    Does NOT duplicate original data columns (GT values, model values, report text, etc.)."""
+    if not S.results:
+        return pd.DataFrame()
+    rows = []
+    for (row_id, col), res in S.results.items():
+        rows.append({
+            "row_id":         row_id,
+            "validation_col": col,
+            "verdict":        res.get("verdict"),
+            "reviewer":       res.get("reviewer"),
+            "timestamp":      res.get("timestamp"),
+            "row_notes":      S.row_notes.get(str(row_id), ""),
+        })
+    return pd.DataFrame(rows)
+
+
+def _find_and_highlight(gt_text: str, model_val: str) -> tuple[str, bool]:
+    """Search for model_val (or a close match) inside gt_text.
+    Returns (html_string, was_found).  The html_string is always HTML-escaped;
+    matches are wrapped in a red highlight <span>.
+    Three-pass strategy: exact → word-level → fuzzy substring."""
+
+    SPAN = ('<span style="background:#e53e3e;color:#fff;padding:1px 4px;'
+            'border-radius:3px;font-weight:600">{}</span>')
+
+    def build_html(text: str, spans: list[tuple[int, int]]) -> str:
+        """Build escaped HTML, injecting highlight spans at the given char ranges."""
+        spans = sorted(set(spans))
+        # Merge overlapping ranges
+        merged: list[list[int]] = []
+        for s, e in spans:
+            if merged and s <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], e)
+            else:
+                merged.append([s, e])
+        out, last = "", 0
+        for s, e in merged:
+            out += _html.escape(text[last:s])
+            out += SPAN.format(_html.escape(text[s:e]))
+            last = e
+        out += _html.escape(text[last:])
+        return out
+
+    model_str = model_val.strip() if model_val else ""
+    if not model_str or model_str in ("—", "None", "nan"):
+        return _html.escape(gt_text), False
+
+    # ── Pass 1: exact case-insensitive ──────────────────────────────────────
+    pattern = re.compile(re.escape(model_str), re.IGNORECASE)
+    hits = [(m.start(), m.end()) for m in pattern.finditer(gt_text)]
+    if hits:
+        return build_html(gt_text, hits), True
+
+    # ── Pass 2: word-level (words ≥ 4 chars from model_val) ─────────────────
+    words = [w for w in re.findall(r"[A-Za-z0-9]+", model_str) if len(w) >= 4]
+    if words:
+        hits = []
+        for word in words:
+            wp = re.compile(r"\b" + re.escape(word) + r"\b", re.IGNORECASE)
+            hits.extend((m.start(), m.end()) for m in wp.finditer(gt_text))
+        if hits:
+            return build_html(gt_text, hits), True
+
+    # ── Pass 3: fuzzy substring (SequenceMatcher, skip for very long model vals)
+    n = len(model_str)
+    if n < 3 or n > 120:
+        return _html.escape(gt_text), False
+
+    gt_lower    = gt_text.lower()
+    model_lower = model_str.lower()
+    best_ratio, best_span = 0.0, (0, 0)
+
+    for window in sorted({n, max(3, int(n * 0.8)), int(n * 1.2)}):
+        for i in range(len(gt_lower) - window + 1):
+            ratio = SequenceMatcher(
+                None, model_lower, gt_lower[i : i + window], autojunk=False
+            ).ratio()
+            if ratio > best_ratio:
+                best_ratio, best_span = ratio, (i, i + window)
+
+    if best_ratio >= 0.82:
+        return build_html(gt_text, [best_span]), True
+
+    return _html.escape(gt_text), False
+
+
+def _render_value(label: str, val, box_class: str, key: str,
+                  highlight_val: str | None = None):
+    """Render a value in a coloured box.
+    Long text scrolls inside the box (no more text_area — keeps the border colour).
+    If highlight_val is given, regex-search for it in val and wrap hits in red."""
     val_str = str(val) if val is not None else "—"
-    st.markdown(f"**{label}**")
-    if len(val_str) > 250:
-        st.text_area(label, value=val_str, height=140, disabled=True,
-                     key=key, label_visibility="collapsed")
+
+    if highlight_val is not None and val_str not in ("—",):
+        display_html, _ = _find_and_highlight(val_str, str(highlight_val))
     else:
-        st.markdown(f'<div class="{box_class}">{val_str}</div>', unsafe_allow_html=True)
+        display_html = _html.escape(val_str)
+
+    scroll = ("max-height:220px;overflow-y:auto;white-space:pre-wrap;"
+              if len(val_str) > 250 else "white-space:pre-wrap;")
+
+    st.markdown(f"**{label}**")
+    st.markdown(
+        f'<div class="{box_class}" style="{scroll}">{display_html}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -602,11 +719,19 @@ def page_setup():
 
     # ── Column roles ────────────────────────────────────────────────────────
     st.subheader("Column Roles")
-    cc1, cc2 = st.columns(2)
+    cc1, cc2, cc3 = st.columns(3)
     with cc1:
         gt = st.multiselect("Ground truth columns (left panel)", cols, default=S.gt_cols)
     with cc2:
         val = st.multiselect("Validation columns (model outputs)", cols, default=S.val_cols)
+    with cc3:
+        explore = st.multiselect(
+            "Exploration columns (togglable on left)",
+            cols, default=S.explore_cols,
+            help="Extra columns you can show/hide during review for context — "
+                 "not validated, not highlighted.",
+        )
+    S.explore_cols = explore
 
     # ── GT linkage ───────────────────────────────────────────────────────────
     if val and gt:
@@ -803,11 +928,29 @@ def page_validate():
     if notes_key not in st.session_state:
         st.session_state[notes_key] = S.row_notes.get(str(row_idx), "")
 
+    # Resolve model value here so the left panel can use it for highlighting
+    model_val = str(row.get(col_name, "")) if col_name in row.index else ""
+
     left, right = st.columns([1, 1], gap="large")
 
     # ── Left: ground truth ───────────────────────────────────────────────────
     with left:
-        st.markdown("### Ground Truth")
+        # Header row: title + explore toggle
+        lh1, lh2 = st.columns([3, 1])
+        with lh1:
+            st.markdown("### Ground Truth")
+        with lh2:
+            if S.explore_cols:
+                toggle_label = (
+                    f"👁 Hide extras ({len(S.explore_cols)})"
+                    if S.explore_visible
+                    else f"👁 Show extras ({len(S.explore_cols)})"
+                )
+                if st.button(toggle_label, key=f"explore_toggle_{pos}",
+                             use_container_width=True):
+                    S.explore_visible = not S.explore_visible
+                    st.rerun()
+
         for c in S.gt_cols:
             is_linked = c in linked_gts
             _render_value(
@@ -815,10 +958,20 @@ def page_validate():
                 row.get(c, "—"),
                 "linked-gt-box" if is_linked else "gt-box",
                 f"gt_{c}_{pos}",
+                highlight_val=model_val if is_linked else None,
             )
         for gc in [g for g in linked_gts if g not in S.gt_cols]:
             _render_value(f"{gc}  ✦ compare", row.get(gc, "—"),
-                          "linked-gt-box", f"lgt_{gc}_{pos}")
+                          "linked-gt-box", f"lgt_{gc}_{pos}",
+                          highlight_val=model_val)
+
+        # Exploration columns — only shown when toggled on
+        if S.explore_visible and S.explore_cols:
+            st.markdown("---")
+            st.markdown("**Exploration**")
+            for c in S.explore_cols:
+                _render_value(c, row.get(c, "—"), "explore-box", f"exp_{c}_{pos}")
+
         st.caption(f"Row {row_idx}")
 
     # ── Right: model output + verdict ────────────────────────────────────────
@@ -833,7 +986,7 @@ def page_validate():
         st.markdown(f"### Model Output — `{col_name}` &nbsp; {badge_html}",
                     unsafe_allow_html=True)
 
-        _render_value("Model output", row.get(col_name, "—"), "model-box", f"mv_{pos}")
+        _render_value("Model output", model_val or "—", "model-box", f"mv_{pos}")
         st.markdown("---")
 
         # Keyboard toggle
@@ -976,34 +1129,52 @@ def page_results():
                 st.plotly_chart(fig, use_container_width=True)
 
             st.subheader("Export")
+            export_df = results_to_export_df()
             dl1, dl2 = st.columns(2)
             fname = S.project_name.replace(" ", "_")
             with dl1:
                 buf = io.StringIO()
-                results_df.to_csv(buf, index=False)
+                export_df.to_csv(buf, index=False)
                 st.download_button("⬇ Download CSV", data=buf.getvalue(),
                                    file_name=f"{fname}_validation.csv", mime="text/csv")
             with dl2:
                 st.download_button("⬇ Download JSON",
-                                   data=results_df.to_json(orient="records", indent=2),
+                                   data=export_df.to_json(orient="records", indent=2),
                                    file_name=f"{fname}_validation.json",
                                    mime="application/json")
+            st.caption(
+                f"Export contains {len(export_df)} rows × 6 columns "
+                f"(`row_id`, `validation_col`, `verdict`, `reviewer`, `timestamp`, `row_notes`). "
+                "Join back to your original data file to access GT and model values."
+            )
 
             st.subheader("Loading in a notebook")
             st.code(
                 'import pandas as pd\n'
-                'from sklearn.metrics import confusion_matrix, cohen_kappa_score, classification_report\n'
-                'df = pd.read_csv("..._validation.csv")\n\n'
+                'from sklearn.metrics import cohen_kappa_score, classification_report\n\n'
+                '# Load the validation results (verdicts only — no duplicated source data)\n'
+                'results = pd.read_csv("..._validation.csv")\n'
+                '# Load your original data file to get GT and model values\n'
+                'orig = pd.read_csv("your_original_data.csv")\n\n'
                 '# --- Categorical column ---\n'
-                'col = df[(df.validation_col=="model_rec_code") & (df.verdict!="skipped")]\n'
-                'print(cohen_kappa_score(col.ground_truth_value, col.model_value))\n\n'
+                'col, gt_col = "model_rec_code", "gt_rec_code"\n'
+                'sub = (\n'
+                '    results[(results.validation_col == col) & (results.verdict != "skipped")]\n'
+                '    .merge(orig[["row_id", col, gt_col]].rename(columns={"row_id": "row_id"}),\n'
+                '           on="row_id", how="left")\n'
+                ')\n'
+                'print(cohen_kappa_score(sub[gt_col], sub[col]))\n\n'
                 '# --- Binary column ---\n'
-                'col = df[(df.validation_col=="model_finding_present") & (df.verdict!="skipped")]\n'
-                'y_true = (col.ground_truth_value == "True").astype(int)\n'
-                'y_pred = (col.model_value        == "True").astype(int)\n'
+                'col, gt_col = "model_finding_present", "gt_finding_present"\n'
+                'sub = (\n'
+                '    results[(results.validation_col == col) & (results.verdict != "skipped")]\n'
+                '    .merge(orig[["row_id", col, gt_col]], on="row_id", how="left")\n'
+                ')\n'
+                'y_true = (sub[gt_col] == "True").astype(int)\n'
+                'y_pred = (sub[col]    == "True").astype(int)\n'
                 'print(classification_report(y_true, y_pred))\n\n'
                 '# --- Row-level notes ---\n'
-                'notes = df[["row_id","row_notes"]].drop_duplicates()',
+                'notes = results[["row_id", "row_notes"]].drop_duplicates()',
                 language="python",
             )
 
@@ -1031,12 +1202,18 @@ def page_results():
                     f"**Mode:** {'Binary  (positive = `' + pos_class + '`)' if mode == 'binary' else 'Categorical'}"
                     f"  ·  **n = {len(sub)}**"
                 )
-                if mode == "binary":
-                    m = _compute_binary_metrics(sub.ground_truth_value, sub.model_value, pos_class)
-                    _render_binary_summary(m, pos_class)
-                else:
-                    m = _compute_categorical_metrics(sub.ground_truth_value, sub.model_value)
-                    _render_categorical_summary(m, sub.ground_truth_value, sub.model_value)
+                # Gate heavy Plotly/sklearn render behind a button so the page
+                # doesn't freeze when first loaded mid-validation.
+                metrics_req_key = ("metrics", sel, mode, pos_class)
+                if st.button("Compute metrics", key="compute_metrics_btn", type="primary"):
+                    st.session_state["metrics_last_req"] = metrics_req_key
+                if st.session_state.get("metrics_last_req") == metrics_req_key:
+                    if mode == "binary":
+                        m = _compute_binary_metrics(sub.ground_truth_value, sub.model_value, pos_class)
+                        _render_binary_summary(m, pos_class)
+                    else:
+                        m = _compute_categorical_metrics(sub.ground_truth_value, sub.model_value)
+                        _render_categorical_summary(m, sub.ground_truth_value, sub.model_value)
 
     with tab_cm:
         st.subheader("Confusion Matrix Generator")
@@ -1044,41 +1221,56 @@ def page_results():
         if not cols_with_gt:
             st.info("No ground truth links configured.")
         else:
+            # ── From validated rows ──────────────────────────────────────────
             st.markdown("#### From validated rows only")
             sel_r    = st.selectbox("Validation column", cols_with_gt, key="cm_rev_val")
             linked_r = _as_list(S.col_gt_map.get(sel_r))
             gt_sel_r = st.selectbox("Ground truth column", linked_r, key="cm_rev_gt")
-            if not results_df.empty:
-                sub_r = results_df[
-                    (results_df.validation_col == sel_r) &
-                    (results_df.verdict != "skipped")
-                ].copy()
-                primary_gt = (_as_list(S.col_gt_map.get(sel_r)) or [None])[0]
-                if gt_sel_r != primary_gt:
-                    sub_r["ground_truth_value"] = S.df.loc[sub_r["row_id"].tolist(), gt_sel_r].values
-                sub_r = sub_r.dropna(subset=["ground_truth_value", "model_value"])
-                if sub_r.empty:
-                    st.info("No reviewed rows yet.")
-                else:
-                    mode_r = S.col_metric_mode.get(sel_r, "categorical")
-                    pos_r  = S.col_positive_class.get(sel_r, "True")
-                    if mode_r == "binary":
-                        m = _compute_binary_metrics(sub_r.ground_truth_value,
-                                                    sub_r.model_value, pos_r)
-                        _render_binary_summary(m, pos_r)
-                    else:
-                        _render_confusion_matrix_raw(sub_r.ground_truth_value,
-                                                     sub_r.model_value, f"n={len(sub_r)}")
-            else:
-                st.info("No results yet.")
 
+            cm_rev_req_key = ("cm_rev", sel_r, gt_sel_r)
+            if st.button("Generate (validated rows)", key="cm_rev_btn", type="primary"):
+                st.session_state["cm_rev_last_req"] = cm_rev_req_key
+
+            if st.session_state.get("cm_rev_last_req") == cm_rev_req_key:
+                if results_df.empty:
+                    st.info("No results yet.")
+                else:
+                    sub_r = results_df[
+                        (results_df.validation_col == sel_r) &
+                        (results_df.verdict != "skipped")
+                    ].copy()
+                    primary_gt = (_as_list(S.col_gt_map.get(sel_r)) or [None])[0]
+                    if gt_sel_r != primary_gt:
+                        sub_r["ground_truth_value"] = S.df.loc[
+                            sub_r["row_id"].tolist(), gt_sel_r].values
+                    sub_r = sub_r.dropna(subset=["ground_truth_value", "model_value"])
+                    if sub_r.empty:
+                        st.info("No reviewed rows yet.")
+                    else:
+                        mode_r = S.col_metric_mode.get(sel_r, "categorical")
+                        pos_r  = S.col_positive_class.get(sel_r, "True")
+                        if mode_r == "binary":
+                            m = _compute_binary_metrics(sub_r.ground_truth_value,
+                                                        sub_r.model_value, pos_r)
+                            _render_binary_summary(m, pos_r)
+                        else:
+                            _render_confusion_matrix_raw(sub_r.ground_truth_value,
+                                                         sub_r.model_value, f"n={len(sub_r)}")
+
+            # ── From full dataset ────────────────────────────────────────────
             st.markdown("---")
             st.markdown("#### From full dataset (all rows)")
             sel2    = st.selectbox("Validation column", cols_with_gt, key="cm_full_val")
             linked2 = _as_list(S.col_gt_map.get(sel2))
             gt2     = st.selectbox("Ground truth column", linked2, key="cm_full_gt")
-            if sel2 and S.df is not None:
-                _render_confusion_matrix(S.df, sel2, gt2)
+
+            cm_full_req_key = ("cm_full", sel2, gt2)
+            if st.button("Generate (full dataset)", key="cm_full_btn", type="primary"):
+                st.session_state["cm_full_last_req"] = cm_full_req_key
+
+            if st.session_state.get("cm_full_last_req") == cm_full_req_key:
+                if S.df is not None:
+                    _render_confusion_matrix(S.df, sel2, gt2)
 
     with tab_raw:
         if results_df.empty:
