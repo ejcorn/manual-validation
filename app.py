@@ -169,6 +169,123 @@ def _keyboard_component(active: bool):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Resizable left/right panel split
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _resize_component():
+    """Inject a drag handle between the two content panels.
+    Width is persisted in browser localStorage — survives navigation and
+    rerenders with no Streamlit round-trip."""
+    js = """
+<script>
+(function() {
+  var STORAGE_KEY = 'vl_left_panel_pct';
+  var par = window.parent;
+  var doc = par.document;
+
+  /* ── Remove stale handle from previous render ── */
+  var old = doc.getElementById('vl-drag-handle');
+  if (old) old.remove();
+
+  function getSavedPct() {
+    var v = parseFloat(localStorage.getItem(STORAGE_KEY));
+    return (isNaN(v) || v < 15 || v > 85) ? 50 : v;
+  }
+  function savePct(pct) { localStorage.setItem(STORAGE_KEY, pct.toFixed(1)); }
+
+  /* ── Find the main [left | right] split block.
+       We anchor to a sentinel element placed just before the columns
+       and pick the first 2-column stHorizontalBlock that follows it. ── */
+  function findSplitBlock() {
+    var anchor = doc.getElementById('vl-split-anchor');
+    if (!anchor) return null;
+    var blocks = doc.querySelectorAll('[data-testid="stHorizontalBlock"]');
+    for (var i = 0; i < blocks.length; i++) {
+      if (!(anchor.compareDocumentPosition(blocks[i]) & Node.DOCUMENT_POSITION_FOLLOWING)) continue;
+      var cols = blocks[i].querySelectorAll(':scope > [data-testid="column"]');
+      if (cols.length === 2) return { block: blocks[i], cols: cols };
+    }
+    return null;
+  }
+
+  function applyPct(cols, pct) {
+    cols[0].style.setProperty('flex', pct + ' 1 0%', 'important');
+    cols[1].style.setProperty('flex', (100 - pct) + ' 1 0%', 'important');
+  }
+
+  /* Position handle in the middle of the gap between the two columns. */
+  function positionHandle(handle, block, cols) {
+    var br = block.getBoundingClientRect();
+    var lr = cols[0].getBoundingClientRect();
+    var rr = cols[1].getBoundingClientRect();
+    if (br.width === 0) return;
+    var mid = (lr.right + rr.left) / 2 - br.left;
+    handle.style.left   = Math.round(mid - 4) + 'px';
+    handle.style.height = block.offsetHeight + 'px';
+  }
+
+  function setup(attempt) {
+    var result = findSplitBlock();
+    if (!result) {
+      if (attempt < 15) setTimeout(function() { setup(attempt + 1); }, 200);
+      return;
+    }
+
+    var pct = getSavedPct();
+    applyPct(result.cols, pct);
+
+    var block = result.block, cols = result.cols;
+    block.style.position = 'relative';
+
+    var handle = doc.createElement('div');
+    handle.id    = 'vl-drag-handle';
+    handle.title = 'Drag to resize panels';
+    handle.style.cssText =
+      'position:absolute;top:0;width:8px;cursor:col-resize;z-index:9999;' +
+      'border-radius:4px;background:transparent;transition:background .15s;' +
+      'user-select:none;-webkit-user-select:none;';
+    positionHandle(handle, block, cols);
+    block.appendChild(handle);
+
+    handle.addEventListener('mouseenter', function() {
+      handle.style.background = 'rgba(33,150,243,0.45)';
+    });
+    handle.addEventListener('mouseleave', function() {
+      if (!par._vlDragging) handle.style.background = 'transparent';
+    });
+
+    handle.addEventListener('mousedown', function(e) {
+      e.preventDefault();
+      par._vlDragging = true;
+      handle.style.background = 'rgba(33,150,243,0.75)';
+      var blockRect = block.getBoundingClientRect();
+
+      function onMove(ev) {
+        var newPct = ((ev.clientX - blockRect.left) / blockRect.width) * 100;
+        newPct = Math.min(Math.max(newPct, 15), 85);
+        applyPct(cols, newPct);
+        savePct(newPct);
+        positionHandle(handle, block, cols);
+      }
+      function onUp() {
+        par._vlDragging = false;
+        handle.style.background = 'transparent';
+        doc.removeEventListener('mousemove', onMove);
+        doc.removeEventListener('mouseup', onUp);
+      }
+      doc.addEventListener('mousemove', onMove);
+      doc.addEventListener('mouseup', onUp);
+    });
+  }
+
+  setup(0);
+})();
+</script>
+"""
+    st.components.v1.html(js, height=0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Save / Load helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -394,9 +511,10 @@ def results_to_df() -> pd.DataFrame:
     return df
 
 
-def results_to_export_df() -> pd.DataFrame:
+def results_to_export_df(extra_cols: list[str] | None = None) -> pd.DataFrame:
     """Minimal export dataframe — only what's needed to compute metrics externally.
-    Does NOT duplicate original data columns (GT values, model values, report text, etc.)."""
+    Does NOT duplicate original data columns by default.
+    Pass extra_cols to join specific columns from S.df by row_id."""
     if not S.results:
         return pd.DataFrame()
     rows = []
@@ -409,7 +527,15 @@ def results_to_export_df() -> pd.DataFrame:
             "timestamp":      res.get("timestamp"),
             "row_notes":      S.row_notes.get(str(row_id), ""),
         })
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    if extra_cols and S.df is not None:
+        valid = [c for c in extra_cols if c in S.df.columns]
+        if valid:
+            extra = S.df[valid].copy()
+            extra.index.name = "row_id"
+            extra = extra.reset_index()
+            df = df.merge(extra, on="row_id", how="left")
+    return df
 
 
 def _find_and_highlight(gt_text: str, model_val: str) -> tuple[str, bool]:
@@ -909,9 +1035,22 @@ def page_validate():
 
     if pos >= total:
         st.success("🎉 All items reviewed!")
-        if st.button("📊 View Results", type="primary"):
-            S.page = "results"
-            st.rerun()
+        done_btn, results_btn, setup_btn = st.columns(3)
+        with done_btn:
+            if st.button("📊 View Results", type="primary", use_container_width=True):
+                S.page = "results"
+                st.rerun()
+        with results_btn:
+            if st.button("⚙ Setup / New Project", use_container_width=True):
+                S.page = "setup"
+                st.rerun()
+        with setup_btn:
+            if st.button("🔄 Review Again (reset queue)", use_container_width=True):
+                S.queue   = build_queue(S.df, S.val_cols, S.mode)
+                S.pos     = 0
+                S.results = {}
+                save_project()
+                st.rerun()
         _keyboard_component(False)
         return
 
@@ -931,6 +1070,9 @@ def page_validate():
     # Resolve model value here so the left panel can use it for highlighting
     model_val = str(row.get(col_name, "")) if col_name in row.index else ""
 
+    # Sentinel: JS drag-resize locates the next 2-column block after this marker
+    st.markdown('<div id="vl-split-anchor" style="display:none;height:0;margin:0;padding:0"></div>',
+                unsafe_allow_html=True)
     left, right = st.columns([1, 1], gap="large")
 
     # ── Left: ground truth ───────────────────────────────────────────────────
@@ -1050,6 +1192,7 @@ def page_validate():
     )
 
     _keyboard_component(S.kb_active)
+    _resize_component()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1129,7 +1272,28 @@ def page_results():
                 st.plotly_chart(fig, use_container_width=True)
 
             st.subheader("Export")
-            export_df = results_to_export_df()
+            # Optional: let the user include specific original-data columns in the export
+            all_src_cols  = list(S.df.columns) if S.df is not None else []
+            base_col_set  = {"row_id", "validation_col", "verdict", "reviewer",
+                             "timestamp", "row_notes"}
+            available_extra = [c for c in all_src_cols if c not in base_col_set]
+            extra_cols = st.multiselect(
+                "Include additional columns from original data (optional)",
+                options=available_extra,
+                default=[],
+                help="These columns are joined by row_id — use to add GT values, "
+                     "report text, or any other field you want alongside the verdicts.",
+            )
+
+            export_df = results_to_export_df(extra_cols=extra_cols or None)
+            base_count = len(base_col_set & set(export_df.columns))
+            st.caption(
+                f"{len(export_df)} rows · {len(export_df.columns)} columns "
+                f"(6 audit cols" +
+                (f" + {len(extra_cols)} original-data cols" if extra_cols else "") +
+                "). Join back to your source file via `row_id` for any remaining columns."
+            )
+
             dl1, dl2 = st.columns(2)
             fname = S.project_name.replace(" ", "_")
             with dl1:
@@ -1142,11 +1306,6 @@ def page_results():
                                    data=export_df.to_json(orient="records", indent=2),
                                    file_name=f"{fname}_validation.json",
                                    mime="application/json")
-            st.caption(
-                f"Export contains {len(export_df)} rows × 6 columns "
-                f"(`row_id`, `validation_col`, `verdict`, `reviewer`, `timestamp`, `row_notes`). "
-                "Join back to your original data file to access GT and model values."
-            )
 
             st.subheader("Loading in a notebook")
             st.code(
