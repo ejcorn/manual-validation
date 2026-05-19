@@ -121,6 +121,7 @@ _DEFAULTS: dict = {
     "results":            {},          # {(row_idx, col_name): result_dict}
     "row_notes":          {},          # {str(row_id): notes_str}  — one per row
     "kb_active":          False,
+    "multi_col_mode":     False,       # validate all val_cols per row simultaneously
 }
 
 for k, v in _DEFAULTS.items():
@@ -168,14 +169,62 @@ def _keyboard_component(active: bool):
     st.components.v1.html(js, height=0)
 
 
+def _keyboard_component_multi(active: bool):
+    """Keyboard shortcuts for multi-col mode.
+    → = Mark All Correct   ← = Mark All Incorrect
+    ↑ = Next row           ↓ = Back
+    Targets the "✓ All Correct" / "✗ All Incorrect" buttons by prefix."""
+    js = f"""
+<script>
+(function() {{
+  var par = window.parent;
+  if (par._vlKeyHandler) {{
+    par.document.removeEventListener('keydown', par._vlKeyHandler);
+    par._vlKeyHandler = null;
+  }}
+  if (!{'true' if active else 'false'}) return;
+  function handler(e) {{
+    var el  = par.document.activeElement;
+    var tag = el ? el.tagName : '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    function clickBtn(startsWith) {{
+      var btns = par.document.querySelectorAll('button');
+      for (var i = 0; i < btns.length; i++) {{
+        if (btns[i].innerText.trim().indexOf(startsWith) === 0) {{
+          btns[i].click(); return;
+        }}
+      }}
+    }}
+    if (e.key === 'ArrowRight') {{ e.preventDefault(); clickBtn('✓ All Correct'); }}
+    if (e.key === 'ArrowLeft')  {{ e.preventDefault(); clickBtn('✗ All Incorrect'); }}
+    if (e.key === 'ArrowUp')    {{ e.preventDefault(); clickBtn('↑ Next'); }}
+    if (e.key === 'ArrowDown')  {{ e.preventDefault(); clickBtn('↓ Back'); }}
+  }}
+  par._vlKeyHandler = handler;
+  par.document.addEventListener('keydown', handler);
+}})();
+</script>
+"""
+    st.components.v1.html(js, height=0)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Resizable left/right panel split
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _resize_component():
     """Inject a drag handle between the two content panels.
-    Width is persisted in browser localStorage — survives navigation and
-    rerenders with no Streamlit round-trip."""
+
+    Strategy: a zero-height marker div is placed as the FIRST child of the
+    left column (inside `with left:`).  Walking up from that marker to the
+    nearest [data-testid="column"] ancestor is unambiguous — unlike searching
+    for sentinel elements placed *outside* the columns.
+
+    A MutationObserver watches each column's style attribute so that the
+    moment Streamlit's React reconciler resets the flex values after a
+    navigation rerender, the saved width is immediately re-applied.
+    Width is persisted in browser localStorage — no Streamlit round-trip.
+    """
     js = """
 <script>
 (function() {
@@ -183,9 +232,10 @@ def _resize_component():
   var par = window.parent;
   var doc = par.document;
 
-  /* ── Remove stale handle from previous render ── */
+  /* ── Tear down any previous instance ── */
   var old = doc.getElementById('vl-drag-handle');
   if (old) old.remove();
+  if (par._vlSplitObs) { par._vlSplitObs.disconnect(); par._vlSplitObs = null; }
 
   function getSavedPct() {
     var v = parseFloat(localStorage.getItem(STORAGE_KEY));
@@ -193,17 +243,21 @@ def _resize_component():
   }
   function savePct(pct) { localStorage.setItem(STORAGE_KEY, pct.toFixed(1)); }
 
-  /* ── Find the main [left | right] split block.
-       We anchor to a sentinel element placed just before the columns
-       and pick the first 2-column stHorizontalBlock that follows it. ── */
+  /* ── Find columns by walking UP from a marker placed inside the left col ── */
   function findSplitBlock() {
-    var anchor = doc.getElementById('vl-split-anchor');
-    if (!anchor) return null;
-    var blocks = doc.querySelectorAll('[data-testid="stHorizontalBlock"]');
-    for (var i = 0; i < blocks.length; i++) {
-      if (!(anchor.compareDocumentPosition(blocks[i]) & Node.DOCUMENT_POSITION_FOLLOWING)) continue;
-      var cols = blocks[i].querySelectorAll(':scope > [data-testid="column"]');
-      if (cols.length === 2) return { block: blocks[i], cols: cols };
+    var marker = doc.getElementById('vl-left-col-marker');
+    if (!marker) return null;
+    var el = marker;
+    while (el && el !== doc.body) {
+      if (el.getAttribute && el.getAttribute('data-testid') === 'column') {
+        var block = el.parentElement;
+        if (block && block.getAttribute('data-testid') === 'stHorizontalBlock') {
+          var cols = block.querySelectorAll(':scope > [data-testid="column"]');
+          if (cols.length === 2) return { block: block, cols: cols };
+        }
+        break;
+      }
+      el = el.parentElement;
     }
     return null;
   }
@@ -213,53 +267,49 @@ def _resize_component():
     cols[1].style.setProperty('flex', (100 - pct) + ' 1 0%', 'important');
   }
 
-  /* Position handle in the middle of the gap between the two columns. */
   function positionHandle(handle, block, cols) {
     var br = block.getBoundingClientRect();
     var lr = cols[0].getBoundingClientRect();
     var rr = cols[1].getBoundingClientRect();
-    if (br.width === 0) return;
-    var mid = (lr.right + rr.left) / 2 - br.left;
-    handle.style.left   = Math.round(mid - 4) + 'px';
+    if (!br.width) return;
+    handle.style.left   = Math.round((lr.right + rr.left) / 2 - br.left - 5) + 'px';
     handle.style.height = block.offsetHeight + 'px';
   }
 
   function setup(attempt) {
     var result = findSplitBlock();
     if (!result) {
-      if (attempt < 15) setTimeout(function() { setup(attempt + 1); }, 200);
+      if (attempt < 20) setTimeout(function() { setup(attempt + 1); }, 150);
       return;
     }
 
     var pct = getSavedPct();
-    applyPct(result.cols, pct);
-
     var block = result.block, cols = result.cols;
+    applyPct(cols, pct);
     block.style.position = 'relative';
 
+    /* ── Build the drag handle ── */
     var handle = doc.createElement('div');
     handle.id    = 'vl-drag-handle';
     handle.title = 'Drag to resize panels';
     handle.style.cssText =
-      'position:absolute;top:0;width:8px;cursor:col-resize;z-index:9999;' +
-      'border-radius:4px;background:transparent;transition:background .15s;' +
+      'position:absolute;top:0;width:10px;cursor:col-resize;z-index:9999;' +
+      'border-radius:5px;background:transparent;transition:background .15s;' +
       'user-select:none;-webkit-user-select:none;';
     positionHandle(handle, block, cols);
     block.appendChild(handle);
 
     handle.addEventListener('mouseenter', function() {
-      handle.style.background = 'rgba(33,150,243,0.45)';
+      handle.style.background = 'rgba(33,150,243,0.5)';
     });
     handle.addEventListener('mouseleave', function() {
       if (!par._vlDragging) handle.style.background = 'transparent';
     });
-
     handle.addEventListener('mousedown', function(e) {
       e.preventDefault();
       par._vlDragging = true;
-      handle.style.background = 'rgba(33,150,243,0.75)';
+      handle.style.background = 'rgba(33,150,243,0.85)';
       var blockRect = block.getBoundingClientRect();
-
       function onMove(ev) {
         var newPct = ((ev.clientX - blockRect.left) / blockRect.width) * 100;
         newPct = Math.min(Math.max(newPct, 15), 85);
@@ -276,6 +326,16 @@ def _resize_component():
       doc.addEventListener('mousemove', onMove);
       doc.addEventListener('mouseup', onUp);
     });
+
+    /* ── Watch for Streamlit resetting column flex styles after rerenders ──
+         Targeting only the two column style attributes keeps this cheap.    */
+    var obs = new MutationObserver(function() {
+      applyPct(cols, getSavedPct());
+      positionHandle(handle, block, cols);
+    });
+    obs.observe(cols[0], { attributes: true, attributeFilter: ['style'] });
+    obs.observe(cols[1], { attributes: true, attributeFilter: ['style'] });
+    par._vlSplitObs = obs;
   }
 
   setup(0);
@@ -283,6 +343,123 @@ def _resize_component():
 </script>
 """
     st.components.v1.html(js, height=0)
+
+
+def _textbox_resize_component():
+    """Persist the user-resized height of each [data-vl-box] div across rows.
+
+    Every text box rendered by _render_value carries a data-vl-box attribute
+    whose value is a stable label-derived key.  On each render we:
+      1. Restore saved heights from localStorage so the box starts at the same
+         size the user left it on the previous row.
+      2. Attach a ResizeObserver so any drag-resize is immediately saved.
+    The observer is replaced on every render — the old one's targets are stale
+    DOM nodes from the previous row and are garbage-collected automatically.
+    """
+    js = """
+<script>
+(function() {
+  var PREFIX = 'vl_box_h_';
+  var par = window.parent;
+  var doc = par.document;
+
+  if (par._vlBoxObs) { par._vlBoxObs.disconnect(); par._vlBoxObs = null; }
+
+  function applyAndWatch(attempt) {
+    var boxes = doc.querySelectorAll('[data-vl-box]');
+    if (!boxes.length) {
+      if (attempt < 20) setTimeout(function() { applyAndWatch(attempt + 1); }, 150);
+      return;
+    }
+
+    /* Restore saved heights */
+    boxes.forEach(function(box) {
+      var k   = box.getAttribute('data-vl-box');
+      var saved = localStorage.getItem(PREFIX + k);
+      if (saved) {
+        box.style.height = saved;
+      }
+      /* Ensure resize handle is active (Streamlit may strip inline styles) */
+      box.style.resize   = 'vertical';
+      box.style.overflow = 'auto';
+    });
+
+    /* Save height whenever the user drags a box */
+    var ro = new ResizeObserver(function(entries) {
+      entries.forEach(function(entry) {
+        var box = entry.target;
+        var k   = box.getAttribute('data-vl-box');
+        if (k && box.offsetHeight > 0) {
+          localStorage.setItem(PREFIX + k, box.offsetHeight + 'px');
+        }
+      });
+    });
+    boxes.forEach(function(box) { ro.observe(box); });
+    par._vlBoxObs = ro;
+  }
+
+  applyAndWatch(0);
+})();
+</script>
+"""
+    st.components.v1.html(js, height=0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Native folder picker  (tkinter — local-only, never sends data anywhere)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pick_directory(target_key: str):
+    """Open the OS native folder-picker and write the chosen path into
+    st.session_state[target_key].
+
+    Tkinter must run on the main thread, which Streamlit's event loop blocks.
+    The fix: spawn a tiny child process that owns its own main thread, runs the
+    dialog there, and returns the path via stdout.  No data leaves the machine.
+    """
+    import subprocess, sys, platform
+    try:
+        system = platform.system()
+        if system == "Darwin":
+            # macOS — AppleScript needs no extra Python packages
+            script = 'POSIX path of (choose folder with prompt "Select project folder")'
+            res = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=120,
+            )
+            chosen = res.stdout.strip() if res.returncode == 0 else ""
+        elif system == "Windows":
+            ps = (
+                "Add-Type -AssemblyName System.Windows.Forms;"
+                "$d=New-Object System.Windows.Forms.FolderBrowserDialog;"
+                "$d.Description='Select project folder';"
+                "$d.ShowNewFolderButton=$true;"
+                "if($d.ShowDialog() -eq 'OK'){Write-Output $d.SelectedPath}"
+            )
+            res = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps],
+                capture_output=True, text=True, timeout=120,
+            )
+            chosen = res.stdout.strip() if res.returncode == 0 else ""
+        else:
+            # Linux — run tkinter in its own subprocess to avoid thread conflict
+            tiny = (
+                "import tkinter as tk, sys;"
+                "from tkinter import filedialog;"
+                "r=tk.Tk(); r.withdraw(); r.wm_attributes('-topmost',True);"
+                "p=filedialog.askdirectory(title='Select project folder');"
+                "r.destroy(); print(p) if p else None"
+            )
+            res = subprocess.run(
+                [sys.executable, "-c", tiny],
+                capture_output=True, text=True, timeout=120,
+            )
+            chosen = res.stdout.strip() if res.returncode == 0 else ""
+
+        if chosen:
+            st.session_state[target_key] = chosen
+    except Exception as exc:
+        st.error(f"Folder picker unavailable: {exc}. Please type the path manually.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -338,6 +515,7 @@ def save_project():
             "col_metric_mode":    S.col_metric_mode,
             "col_positive_class": S.col_positive_class,
             "mode":               S.mode,
+            "multi_col_mode":     S.multi_col_mode,
             "queue":              [[int(r) if isinstance(r, (int, np.integer)) else r, c]
                                    for r, c in S.queue],
             "pos":                int(S.pos),
@@ -385,6 +563,7 @@ def load_project(save_dir: str) -> tuple[bool, str]:
         S.col_metric_mode    = state.get("col_metric_mode", {})
         S.col_positive_class = state.get("col_positive_class", {})
         S.mode               = state.get("mode", "by_column")
+        S.multi_col_mode     = state.get("multi_col_mode", False)
         S.queue              = [tuple(q) for q in state.get("queue", [])]
         S.pos                = state.get("pos", 0)
         S.row_notes          = state.get("row_notes", {})
@@ -610,8 +789,9 @@ def _find_and_highlight(gt_text: str, model_val: str) -> tuple[str, bool]:
 
 def _render_value(label: str, val, box_class: str, key: str,
                   highlight_val: str | None = None):
-    """Render a value in a coloured box.
-    Long text scrolls inside the box (no more text_area — keeps the border colour).
+    """Render a value in a coloured, vertically-resizable box.
+    Height is persisted across rows via localStorage keyed by a stable
+    sanitised label so resizing one row carries over to the next.
     If highlight_val is given, regex-search for it in val and wrap hits in red."""
     val_str = str(val) if val is not None else "—"
 
@@ -620,12 +800,17 @@ def _render_value(label: str, val, box_class: str, key: str,
     else:
         display_html = _html.escape(val_str)
 
-    scroll = ("max-height:220px;overflow-y:auto;white-space:pre-wrap;"
-              if len(val_str) > 250 else "white-space:pre-wrap;")
+    # Stable key for localStorage — derived from label, not row position
+    storage_key = re.sub(r'\W+', '_', label).strip('_')
+
+    # All boxes are vertically resizable; long content gets a taller default
+    default_h = "height:220px;" if len(val_str) > 250 else "height:80px;"
+    box_style  = f"overflow-y:auto;resize:vertical;white-space:pre-wrap;min-height:40px;{default_h}"
 
     st.markdown(f"**{label}**")
     st.markdown(
-        f'<div class="{box_class}" style="{scroll}">{display_html}</div>',
+        f'<div class="{box_class}" style="{box_style}" data-vl-box="{storage_key}">'
+        f'{display_html}</div>',
         unsafe_allow_html=True,
     )
 
@@ -777,13 +962,30 @@ def _render_confusion_matrix(df: pd.DataFrame, val_col: str, gt_col: str):
 def page_setup():
     st.title("LLM Output Validator")
 
+    # ── Flush any browse-picker results into widget keys BEFORE widgets render.
+    #    We must do this first: Streamlit raises an error if you write to a
+    #    widget's key after the widget has already rendered in this execution.
+    for _desired, _widget in [
+        ("resume_path_desired", "resume_path_input"),
+        ("save_dir_desired",    "save_dir_widget"),
+    ]:
+        if st.session_state.get(_desired):
+            st.session_state[_widget] = st.session_state.pop(_desired)
+
     # ── Resume existing project ──────────────────────────────────────────────
     st.subheader("Resume a saved project")
-    resume_input = st.text_input(
-        "Path to existing project directory",
-        placeholder="/Users/you/projects/my-validation",
-        key="resume_path_input",
-    )
+    rp_col, rp_btn = st.columns([5, 1])
+    with rp_col:
+        resume_input = st.text_input(
+            "Path to existing project directory",
+            placeholder="/Users/you/projects/my-validation",
+            key="resume_path_input",
+        )
+    with rp_btn:
+        st.markdown('<div style="height:1.75rem"></div>', unsafe_allow_html=True)
+        if st.button("📁 Browse", key="browse_resume", use_container_width=True):
+            _pick_directory("resume_path_desired")   # ← staging key, not widget key
+            st.rerun()
     if resume_input:
         summary = project_summary(resume_input)
         if summary:
@@ -814,12 +1016,22 @@ def page_setup():
     with c2:
         S.reviewer = st.text_input("Reviewer ID", value=S.reviewer)
 
-    save_dir_input = st.text_input(
-        "Save directory (full path — created if it doesn't exist)",
-        value=S.save_dir,
-        placeholder="/Users/you/projects/my-validation",
-        help="Project state is auto-saved here after every verdict so you can resume later.",
-    )
+    # Initialise widget state from session so Browse result survives reruns
+    if "save_dir_widget" not in st.session_state:
+        st.session_state["save_dir_widget"] = S.save_dir
+    sd_col, sd_btn = st.columns([5, 1])
+    with sd_col:
+        save_dir_input = st.text_input(
+            "Save directory (full path — created if it doesn't exist)",
+            placeholder="/Users/you/projects/my-validation",
+            key="save_dir_widget",
+            help="Project state is auto-saved here after every verdict so you can resume later.",
+        )
+    with sd_btn:
+        st.markdown('<div style="height:1.75rem"></div>', unsafe_allow_html=True)
+        if st.button("📁 Browse", key="browse_save_dir", use_container_width=True):
+            _pick_directory("save_dir_desired")      # ← staging key, not widget key
+            st.rerun()
     S.save_dir = save_dir_input
 
     uploaded = st.file_uploader(
@@ -847,13 +1059,13 @@ def page_setup():
     st.subheader("Column Roles")
     cc1, cc2, cc3 = st.columns(3)
     with cc1:
-        gt = st.multiselect("Ground truth columns (left panel)", cols, default=S.gt_cols)
+        gt = st.multiselect("Ground truth columns (left panel)", cols, default=[])
     with cc2:
-        val = st.multiselect("Validation columns (model outputs)", cols, default=S.val_cols)
+        val = st.multiselect("Validation columns (model outputs)", cols, default=[])
     with cc3:
         explore = st.multiselect(
             "Exploration columns (togglable on left)",
-            cols, default=S.explore_cols,
+            cols, default=[],
             help="Extra columns you can show/hide during review for context — "
                  "not validated, not highlighted.",
         )
@@ -867,10 +1079,8 @@ def page_setup():
         link_cols = st.columns(min(len(val), 3))
         for i, vc in enumerate(val):
             with link_cols[i % len(link_cols)]:
-                prev   = _as_list(S.col_gt_map.get(vc))
                 chosen = st.multiselect(
-                    f"`{vc}`", options=gt,
-                    default=[c for c in prev if c in gt],
+                    f"`{vc}`", options=gt, default=[],
                     key=f"gtmap_{vc}",
                 )
                 if chosen:
@@ -930,6 +1140,14 @@ def page_setup():
             "Rows to validate (0 = all)", min_value=0, max_value=len(df), value=0, step=1
         )
 
+    multi_col_mode = st.checkbox(
+        "Validate all columns simultaneously (show every model output per row on the right)",
+        value=S.multi_col_mode,
+        help="When checked, all validation columns are shown side-by-side on the right panel "
+             "so you can verdict each one without advancing to the next row. "
+             "The left panel and all existing functionality are unchanged.",
+    )
+
     st.markdown("---")
     if st.button("▶ Start Validation", type="primary"):
         if not val:
@@ -938,14 +1156,21 @@ def page_setup():
         if not S.save_dir:
             st.error("Please enter a save directory — required for auto-save.")
             return
-        S.gt_cols  = gt
-        S.val_cols = val
-        S.mode     = mode
+        S.gt_cols        = gt
+        S.val_cols       = val
+        S.mode           = mode
+        S.multi_col_mode = multi_col_mode
         working_df = df.copy()
         if sample_n > 0:
             working_df = df.sample(n=int(sample_n), random_state=42).reset_index(drop=True)
             S.df = working_df
-        S.queue     = build_queue(S.df, val, mode)
+        if S.multi_col_mode:
+            rows = list(S.df.index)
+            if mode == "random":
+                random.shuffle(rows)
+            S.queue = [(r, "__MULTI__") for r in rows]
+        else:
+            S.queue = build_queue(S.df, val, mode)
         S.pos       = 0
         S.row_notes = {}
         S.results   = {}
@@ -1009,9 +1234,11 @@ def page_validate():
 
         if S.results:
             st.markdown("---\n**Progress by column:**")
+            # In multi-col mode every queue entry covers all val_cols for one row
+            n_rows = len(set(r for r, _ in queue))
             for vc in S.val_cols:
                 col_r   = [r for r in S.results.values() if r["validation_col"] == vc]
-                n_col   = sum(1 for (_, ci) in queue if ci == vc)
+                n_col   = n_rows if S.multi_col_mode else sum(1 for (_, ci) in queue if ci == vc)
                 done    = len(col_r)
                 correct = sum(1 for r in col_r if r["verdict"] == "correct")
                 acc     = f"{correct/done:.0%}" if done else "—"
@@ -1055,29 +1282,52 @@ def page_validate():
         return
 
     row_idx, col_name = queue[pos]
-    row         = S.df.loc[row_idx]
-    existing    = S.results.get((row_idx, col_name))
-    linked_gts  = _as_list(S.col_gt_map.get(col_name))
-    metric_mode = S.col_metric_mode.get(col_name, "categorical")
-    pos_class   = S.col_positive_class.get(col_name, "True")
+    row        = S.df.loc[row_idx]
+    is_multi   = (col_name == "__MULTI__")
 
     # ── Notes widget — one per row, shared across all columns ────────────────
-    # Pre-init from S.row_notes so loaded projects show correctly
     notes_key = f"rownotes_{row_idx}"
     if notes_key not in st.session_state:
         st.session_state[notes_key] = S.row_notes.get(str(row_idx), "")
 
-    # Resolve model value here so the left panel can use it for highlighting
-    model_val = str(row.get(col_name, "")) if col_name in row.index else ""
+    # ── Variables used by single-col mode only ───────────────────────────────
+    if not is_multi:
+        existing       = S.results.get((row_idx, col_name))
+        linked_gts     = _as_list(S.col_gt_map.get(col_name))
+        metric_mode    = S.col_metric_mode.get(col_name, "categorical")
+        pos_class      = S.col_positive_class.get(col_name, "True")
+        model_val      = str(row.get(col_name, "")) if col_name in row.index else ""
+        gt_highlight_map = {}   # unused in single-col mode
+    else:
+        existing    = None
+        linked_gts  = list(S.gt_cols)   # all GT cols shown as linked
+        metric_mode = None
+        pos_class   = None
+        model_val   = ""
+        # Reverse of col_gt_map: for each GT col, what model value should be
+        # highlighted in it?  Built so each GT col is highlighted with the
+        # model value from its linked validation column.
+        gt_highlight_map: dict[str, str] = {}
+        for vc in S.val_cols:
+            mv = str(row.get(vc, "")) if vc in row.index else ""
+            for gc in _as_list(S.col_gt_map.get(vc)):
+                if gc not in gt_highlight_map:   # first linked val_col wins
+                    gt_highlight_map[gc] = mv
 
-    # Sentinel: JS drag-resize locates the next 2-column block after this marker
-    st.markdown('<div id="vl-split-anchor" style="display:none;height:0;margin:0;padding:0"></div>',
-                unsafe_allow_html=True)
+        # Auto-default: pre-fill all columns as "correct" when first arriving
+        # at a row. Reviewer only needs to flip the incorrect ones.
+        if not any(S.results.get((row_idx, vc)) for vc in S.val_cols):
+            for vc in S.val_cols:
+                record_verdict(row_idx, vc, "correct")
+            save_project()
+
     left, right = st.columns([1, 1], gap="large")
 
-    # ── Left: ground truth ───────────────────────────────────────────────────
+    # ── Left: ground truth (identical for both modes) ────────────────────────
     with left:
-        # Header row: title + explore toggle
+        # Zero-height marker: JS walks UP from here to find this column div.
+        st.markdown('<div id="vl-left-col-marker" style="height:0;overflow:hidden;margin:0;padding:0"></div>',
+                    unsafe_allow_html=True)
         lh1, lh2 = st.columns([3, 1])
         with lh1:
             st.markdown("### Ground Truth")
@@ -1095,19 +1345,23 @@ def page_validate():
 
         for c in S.gt_cols:
             is_linked = c in linked_gts
+            if is_multi:
+                hval = gt_highlight_map.get(c)   # per-column model value
+            else:
+                hval = model_val if is_linked else None
             _render_value(
                 f"{c}  ✦ compare" if is_linked else c,
                 row.get(c, "—"),
                 "linked-gt-box" if is_linked else "gt-box",
                 f"gt_{c}_{pos}",
-                highlight_val=model_val if is_linked else None,
+                highlight_val=hval,
             )
         for gc in [g for g in linked_gts if g not in S.gt_cols]:
+            hval = gt_highlight_map.get(gc) if is_multi else model_val
             _render_value(f"{gc}  ✦ compare", row.get(gc, "—"),
                           "linked-gt-box", f"lgt_{gc}_{pos}",
-                          highlight_val=model_val)
+                          highlight_val=hval)
 
-        # Exploration columns — only shown when toggled on
         if S.explore_visible and S.explore_cols:
             st.markdown("---")
             st.markdown("**Exploration**")
@@ -1116,73 +1370,199 @@ def page_validate():
 
         st.caption(f"Row {row_idx}")
 
-    # ── Right: model output + verdict ────────────────────────────────────────
+    # ── Right: single-col verdict ─────────────────────────────────────────────
     with right:
-        badge_html = (
-            f'<span style="background:#d4edda;color:#155724;padding:2px 8px;'
-            f'border-radius:4px;font-size:0.8em;font-weight:600;">BINARY · pos="{pos_class}"</span>'
-            if metric_mode == "binary" else
-            f'<span style="background:#cce5ff;color:#004085;padding:2px 8px;'
-            f'border-radius:4px;font-size:0.8em;font-weight:600;">CATEGORICAL</span>'
-        )
-        st.markdown(f"### Model Output — `{col_name}` &nbsp; {badge_html}",
-                    unsafe_allow_html=True)
+        if not is_multi:
+            badge_html = (
+                f'<span style="background:#d4edda;color:#155724;padding:2px 8px;'
+                f'border-radius:4px;font-size:0.8em;font-weight:600;">BINARY · pos="{pos_class}"</span>'
+                if metric_mode == "binary" else
+                f'<span style="background:#cce5ff;color:#004085;padding:2px 8px;'
+                f'border-radius:4px;font-size:0.8em;font-weight:600;">CATEGORICAL</span>'
+            )
+            st.markdown(f"### Model Output — `{col_name}` &nbsp; {badge_html}",
+                        unsafe_allow_html=True)
+            _render_value("Model output", model_val or "—", "model-box", f"mv_{pos}")
+            st.markdown("---")
 
-        _render_value("Model output", model_val or "—", "model-box", f"mv_{pos}")
-        st.markdown("---")
+            kb_col, hint_col = st.columns([1, 3])
+            with kb_col:
+                if st.button("⌨ Keys ON" if S.kb_active else "⌨ Keys OFF",
+                             key=f"kb_toggle_{pos}"):
+                    S.kb_active = not S.kb_active
+                    st.rerun()
+            with hint_col:
+                if S.kb_active:
+                    st.markdown(
+                        '<span class="shortcut-hint">'
+                        '→ correct &nbsp;|&nbsp; ← incorrect &nbsp;|&nbsp; ↑ next &nbsp;|&nbsp; ↓ back'
+                        '</span>', unsafe_allow_html=True)
+                else:
+                    st.markdown('<span class="shortcut-off">keyboard shortcuts off</span>',
+                                unsafe_allow_html=True)
 
-        # Keyboard toggle
-        kb_col, hint_col = st.columns([1, 3])
-        with kb_col:
-            if st.button("⌨ Keys ON" if S.kb_active else "⌨ Keys OFF",
-                         key=f"kb_toggle_{pos}"):
-                S.kb_active = not S.kb_active
-                st.rerun()
-        with hint_col:
-            if S.kb_active:
-                st.markdown(
-                    '<span class="shortcut-hint">'
-                    '→ correct &nbsp;|&nbsp; ← incorrect &nbsp;|&nbsp; ↑ next &nbsp;|&nbsp; ↓ back'
-                    '</span>', unsafe_allow_html=True)
-            else:
-                st.markdown('<span class="shortcut-off">keyboard shortcuts off</span>',
+            bc1, bc2, bc3, bc4 = st.columns(4)
+            with bc1:
+                if st.button("✓ Correct", type="primary", key=f"yes_{pos}", use_container_width=True):
+                    _flush_notes_and_save(row_idx)
+                    record_verdict(row_idx, col_name, "correct")
+                    save_project()
+                    S.pos = min(pos + 1, total)
+                    st.rerun()
+            with bc2:
+                if st.button("✗ Incorrect", key=f"no_{pos}", use_container_width=True):
+                    _flush_notes_and_save(row_idx)
+                    record_verdict(row_idx, col_name, "incorrect")
+                    save_project()
+                    S.pos = min(pos + 1, total)
+                    st.rerun()
+            with bc3:
+                if st.button("↑ Next", key=f"next_{pos}", use_container_width=True):
+                    _flush_notes_and_save(row_idx)
+                    S.pos = min(pos + 1, total)
+                    st.rerun()
+            with bc4:
+                if st.button("↓ Back", key=f"back_{pos}", use_container_width=True):
+                    _flush_notes_and_save(row_idx)
+                    S.pos = max(pos - 1, 0)
+                    st.rerun()
+
+            if existing:
+                v   = existing["verdict"]
+                cls = {"correct": "verdict-correct", "incorrect": "verdict-incorrect",
+                       "skipped": "verdict-skipped"}.get(v, "")
+                st.markdown(f'<div class="{cls}">Previously: {v.upper()}</div>',
                             unsafe_allow_html=True)
 
-        # Verdict buttons
-        bc1, bc2, bc3, bc4 = st.columns(4)
-        with bc1:
-            if st.button("✓ Correct", type="primary", key=f"yes_{pos}", use_container_width=True):
-                _flush_notes_and_save(row_idx)
-                record_verdict(row_idx, col_name, "correct")
-                save_project()
-                S.pos = min(pos + 1, total)
-                st.rerun()
-        with bc2:
-            if st.button("✗ Incorrect", key=f"no_{pos}", use_container_width=True):
-                _flush_notes_and_save(row_idx)
-                record_verdict(row_idx, col_name, "incorrect")
-                save_project()
-                S.pos = min(pos + 1, total)
-                st.rerun()
-        with bc3:
-            if st.button("↑ Next", key=f"next_{pos}", use_container_width=True):
-                _flush_notes_and_save(row_idx)
-                S.pos = min(pos + 1, total)
-                st.rerun()
-        with bc4:
-            if st.button("↓ Back", key=f"back_{pos}", use_container_width=True):
-                _flush_notes_and_save(row_idx)
-                S.pos = max(pos - 1, 0)
-                st.rerun()
+        # ── Right: multi-col verdict panel ────────────────────────────────────
+        else:
+            n_judged = sum(
+                1 for vc in S.val_cols
+                if S.results.get((row_idx, vc), {}).get("verdict") in ("correct", "incorrect")
+            )
+            all_judged = (n_judged == len(S.val_cols))
 
-        if existing:
-            v   = existing["verdict"]
-            cls = {"correct": "verdict-correct", "incorrect": "verdict-incorrect",
-                   "skipped": "verdict-skipped"}.get(v, "")
-            st.markdown(f'<div class="{cls}">Previously: {v.upper()}</div>',
-                        unsafe_allow_html=True)
+            # Header row: title + keyboard toggle
+            mh1, mh2 = st.columns([3, 1])
+            with mh1:
+                st.markdown("### Model Outputs — All Columns")
+                st.caption(
+                    f"{n_judged} / {len(S.val_cols)} judged"
+                    + ("  ✓ all done" if all_judged else "")
+                )
+            with mh2:
+                if st.button("⌨ Keys ON" if S.kb_active else "⌨ Keys OFF",
+                             key=f"mc_kb_toggle_{pos}"):
+                    S.kb_active = not S.kb_active
+                    st.rerun()
+                if S.kb_active:
+                    st.markdown(
+                        '<div style="font-size:0.78em;color:#555;margin-top:2px">'
+                        '→ all ✓ &nbsp;← all ✗<br>↑ next &nbsp;↓ back</div>',
+                        unsafe_allow_html=True,
+                    )
 
-    # ── Row notes — rendered full-width below both panels ────────────────────
+            # Mark-all buttons
+            ma1, ma2 = st.columns(2)
+            with ma1:
+                if st.button("✓ All Correct", key=f"mc_all_yes_{pos}",
+                             use_container_width=True, type="primary"):
+                    _flush_notes_and_save(row_idx)
+                    for vc in S.val_cols:
+                        record_verdict(row_idx, vc, "correct")
+                    save_project()
+                    st.rerun()
+            with ma2:
+                if st.button("✗ All Incorrect", key=f"mc_all_no_{pos}",
+                             use_container_width=True):
+                    _flush_notes_and_save(row_idx)
+                    for vc in S.val_cols:
+                        record_verdict(row_idx, vc, "incorrect")
+                    save_project()
+                    st.rerun()
+
+            st.markdown("---")
+
+            # One compact row per validation column
+            for vc in S.val_cols:
+                mv = str(row.get(vc, "—")) if vc in row.index else "—"
+                vc_res = S.results.get((row_idx, vc))
+                cur_v  = vc_res["verdict"] if vc_res else None
+                mm     = S.col_metric_mode.get(vc, "categorical")
+                pc     = S.col_positive_class.get(vc, "True")
+
+                badge_html = (
+                    f'<span style="background:#d4edda;color:#155724;padding:1px 5px;'
+                    f'border-radius:3px;font-size:0.75em;font-weight:600;">BIN·{pc}</span>'
+                    if mm == "binary" else
+                    f'<span style="background:#cce5ff;color:#004085;padding:1px 5px;'
+                    f'border-radius:3px;font-size:0.75em;font-weight:600;">CAT</span>'
+                )
+                if cur_v == "correct":
+                    status_html = '<span class="verdict-correct" style="font-size:1.3em">✓</span>'
+                elif cur_v == "incorrect":
+                    status_html = '<span class="verdict-incorrect" style="font-size:1.3em">✗</span>'
+                else:
+                    status_html = '<span style="color:#bbb;font-size:1.3em">·</span>'
+
+                ci, cy, cn, cs = st.columns([5, 1, 1, 0.6])
+                with ci:
+                    st.markdown(
+                        f'<div style="font-weight:600;font-size:0.9em">'
+                        f'`{vc}` &nbsp;{badge_html}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    mv_esc = _html.escape(mv)
+                    st.markdown(
+                        f'<div style="background:#fff8e1;border-left:3px solid #ffc107;'
+                        f'padding:4px 8px;border-radius:4px;font-size:0.9em;'
+                        f'max-height:72px;overflow-y:auto;white-space:pre-wrap;">'
+                        f'{mv_esc}</div>',
+                        unsafe_allow_html=True,
+                    )
+                with cy:
+                    st.markdown('<div style="height:1.4rem"></div>', unsafe_allow_html=True)
+                    if st.button("✓", key=f"mc_yes_{vc}_{pos}",
+                                 use_container_width=True, help="Correct",
+                                 type="primary" if cur_v == "correct" else "secondary"):
+                        _flush_notes_and_save(row_idx)
+                        record_verdict(row_idx, vc, "correct")
+                        save_project()
+                        st.rerun()
+                with cn:
+                    st.markdown('<div style="height:1.4rem"></div>', unsafe_allow_html=True)
+                    if st.button("✗", key=f"mc_no_{vc}_{pos}",
+                                 use_container_width=True, help="Incorrect"):
+                        _flush_notes_and_save(row_idx)
+                        record_verdict(row_idx, vc, "incorrect")
+                        save_project()
+                        st.rerun()
+                with cs:
+                    st.markdown('<div style="height:1.4rem"></div>', unsafe_allow_html=True)
+                    st.markdown(f'<div style="text-align:center">{status_html}</div>',
+                                unsafe_allow_html=True)
+
+                st.markdown(
+                    '<hr style="margin:4px 0;border:none;border-top:1px solid #eee">',
+                    unsafe_allow_html=True,
+                )
+
+            # Navigation
+            st.markdown("")
+            nb1, nb2 = st.columns(2)
+            with nb1:
+                if st.button("↓ Back", key=f"mc_back_{pos}", use_container_width=True):
+                    _flush_notes_and_save(row_idx)
+                    S.pos = max(pos - 1, 0)
+                    st.rerun()
+            with nb2:
+                if st.button("↑ Next", key=f"mc_next_{pos}",
+                             use_container_width=True, type="primary"):
+                    _flush_notes_and_save(row_idx)
+                    S.pos = min(pos + 1, total)
+                    st.rerun()
+
+    # ── Row notes — full-width below both panels (both modes) ────────────────
     st.markdown("---")
     st.text_area(
         f"📝 Notes for row {row_idx}  *(shared across all columns — appends as you add more)*",
@@ -1191,8 +1571,13 @@ def page_validate():
         placeholder="Any observations, corrections, or flags for this row…",
     )
 
-    _keyboard_component(S.kb_active)
+    if is_multi:
+        # Multi-col keyboard: → all correct | ← all incorrect | ↑ next | ↓ back
+        _keyboard_component_multi(S.kb_active)
+    else:
+        _keyboard_component(S.kb_active)
     _resize_component()
+    _textbox_resize_component()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
