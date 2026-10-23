@@ -122,7 +122,11 @@ _DEFAULTS: dict = {
     "row_notes":          {},          # {str(row_id): notes_str}  — one per row
     "kb_active":          False,
     "multi_col_mode":     False,       # validate all val_cols per row simultaneously
+    "multi_hl_active":    {},          # {val_col: bool} — per-col highlight toggle
 }
+
+# Distinct colors for per-column highlights in multi-col mode
+_HL_PALETTE = ["#e53e3e","#3182ce","#38a169","#d69e2e","#805ad5","#dd6b20","#0694a2","#e91e63"]
 
 for k, v in _DEFAULTS.items():
     if k not in st.session_state:
@@ -717,85 +721,108 @@ def results_to_export_df(extra_cols: list[str] | None = None) -> pd.DataFrame:
     return df
 
 
-def _find_and_highlight(gt_text: str, model_val: str) -> tuple[str, bool]:
-    """Search for model_val (or a close match) inside gt_text.
-    Returns (html_string, was_found).  The html_string is always HTML-escaped;
-    matches are wrapped in a red highlight <span>.
-    Three-pass strategy: exact → word-level → fuzzy substring."""
-
-    SPAN = ('<span style="background:#e53e3e;color:#fff;padding:1px 4px;'
-            'border-radius:3px;font-weight:600">{}</span>')
-
-    def build_html(text: str, spans: list[tuple[int, int]]) -> str:
-        """Build escaped HTML, injecting highlight spans at the given char ranges."""
-        spans = sorted(set(spans))
-        # Merge overlapping ranges
-        merged: list[list[int]] = []
-        for s, e in spans:
-            if merged and s <= merged[-1][1]:
-                merged[-1][1] = max(merged[-1][1], e)
-            else:
-                merged.append([s, e])
-        out, last = "", 0
-        for s, e in merged:
-            out += _html.escape(text[last:s])
-            out += SPAN.format(_html.escape(text[s:e]))
-            last = e
-        out += _html.escape(text[last:])
-        return out
-
-    model_str = model_val.strip() if model_val else ""
+def _find_spans(gt_text: str, model_str: str) -> list[tuple[int, int]]:
+    """Core 3-pass span finder. Returns list of (start, end) char ranges.
+    Pass 1: exact case-insensitive → Pass 2: word-level → Pass 3: fuzzy."""
+    model_str = model_str.strip() if model_str else ""
     if not model_str or model_str in ("—", "None", "nan"):
-        return _html.escape(gt_text), False
+        return []
 
-    # ── Pass 1: exact case-insensitive ──────────────────────────────────────
-    pattern = re.compile(re.escape(model_str), re.IGNORECASE)
-    hits = [(m.start(), m.end()) for m in pattern.finditer(gt_text)]
+    # Pass 1: exact
+    hits = [(m.start(), m.end()) for m in
+            re.compile(re.escape(model_str), re.IGNORECASE).finditer(gt_text)]
     if hits:
-        return build_html(gt_text, hits), True
+        return hits
 
-    # ── Pass 2: word-level (words ≥ 4 chars from model_val) ─────────────────
+    # Pass 2: word-level (words ≥ 4 chars)
     words = [w for w in re.findall(r"[A-Za-z0-9]+", model_str) if len(w) >= 4]
     if words:
         hits = []
         for word in words:
-            wp = re.compile(r"\b" + re.escape(word) + r"\b", re.IGNORECASE)
-            hits.extend((m.start(), m.end()) for m in wp.finditer(gt_text))
+            hits.extend((m.start(), m.end()) for m in
+                        re.compile(r"\b" + re.escape(word) + r"\b",
+                                   re.IGNORECASE).finditer(gt_text))
         if hits:
-            return build_html(gt_text, hits), True
+            return hits
 
-    # ── Pass 3: fuzzy substring (SequenceMatcher, skip for very long model vals)
+    # Pass 3: fuzzy (SequenceMatcher)
     n = len(model_str)
     if n < 3 or n > 120:
-        return _html.escape(gt_text), False
-
-    gt_lower    = gt_text.lower()
-    model_lower = model_str.lower()
+        return []
+    gt_lower, model_lower = gt_text.lower(), model_str.lower()
     best_ratio, best_span = 0.0, (0, 0)
-
     for window in sorted({n, max(3, int(n * 0.8)), int(n * 1.2)}):
         for i in range(len(gt_lower) - window + 1):
             ratio = SequenceMatcher(
-                None, model_lower, gt_lower[i : i + window], autojunk=False
+                None, model_lower, gt_lower[i: i + window], autojunk=False
             ).ratio()
             if ratio > best_ratio:
                 best_ratio, best_span = ratio, (i, i + window)
+    return [best_span] if best_ratio >= 0.82 else []
 
-    if best_ratio >= 0.82:
-        return build_html(gt_text, [best_span]), True
 
-    return _html.escape(gt_text), False
+def _build_highlight_html(text: str,
+                           colored_spans: list[tuple[int, int, str]]) -> str:
+    """Build HTML from a list of (start, end, color_hex) spans.
+    Sorts and merges overlapping spans; overlapping regions keep the
+    color of whichever span started first."""
+    if not colored_spans:
+        return _html.escape(text)
+    colored_spans = sorted(colored_spans, key=lambda x: x[0])
+    merged: list[list] = []
+    for s, e, c in colored_spans:
+        if merged and s < merged[-1][1]:                  # overlap — extend, keep first color
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e, c])
+    out, last = "", 0
+    for s, e, c in merged:
+        out += _html.escape(text[last:s])
+        out += (f'<span style="background:{c};color:#fff;padding:1px 4px;'
+                f'border-radius:3px;font-weight:600">'
+                f'{_html.escape(text[s:e])}</span>')
+        last = e
+    out += _html.escape(text[last:])
+    return out
+
+
+def _find_and_highlight(gt_text: str, model_val: str) -> tuple[str, bool]:
+    """Single-color (red) highlight — used in single-col validation mode.
+    Returns (html_string, was_found)."""
+    spans = _find_spans(gt_text, model_val)
+    if not spans:
+        return _html.escape(gt_text), False
+    html = _build_highlight_html(gt_text, [(s, e, "#e53e3e") for s, e in spans])
+    return html, True
+
+
+def _find_and_highlight_multi(gt_text: str,
+                               items: list[tuple[str, str]]) -> str:
+    """Multi-color highlight for multi-col validation mode.
+    items = [(search_value, color_hex), ...]
+    Each active val-col contributes its own color; overlapping matches
+    keep the color of the earlier-starting span."""
+    if not items or not gt_text:
+        return _html.escape(gt_text)
+    colored_spans: list[tuple[int, int, str]] = []
+    for search_val, color in items:
+        for s, e in _find_spans(gt_text, search_val):
+            colored_spans.append((s, e, color))
+    return _build_highlight_html(gt_text, colored_spans)
 
 
 def _render_value(label: str, val, box_class: str, key: str,
-                  highlight_val: str | None = None):
+                  highlight_val: str | None = None,
+                  highlight_items: list[tuple[str, str]] | None = None):
     """Render a value in a coloured, vertically-resizable box.
-    Height is persisted across rows via localStorage keyed by a stable
-    sanitised label so resizing one row carries over to the next.
-    If highlight_val is given, regex-search for it in val and wrap hits in red."""
+    highlight_items = [(search_val, color_hex), ...] for multi-color (multi-col mode).
+    highlight_val   = single string → single red highlight (single-col mode).
+    highlight_items takes precedence when both are supplied."""
     val_str = str(val) if val is not None else "—"
 
-    if highlight_val is not None and val_str not in ("—",):
+    if highlight_items and val_str not in ("—",):
+        display_html = _find_and_highlight_multi(val_str, highlight_items)
+    elif highlight_val is not None and val_str not in ("—",):
         display_html, _ = _find_and_highlight(val_str, str(highlight_val))
     else:
         display_html = _html.escape(val_str)
@@ -1232,6 +1259,75 @@ def page_validate():
             S.page = "setup"
             st.rerun()
 
+        # ── Adjust project without restarting ───────────────────────────────
+        st.markdown("---")
+        with st.expander("✏️ Adjust project"):
+            if S.df is not None:
+                all_cols = list(S.df.columns)
+                st.caption("Changes take effect immediately — no restart needed.")
+
+                adj_val = st.multiselect(
+                    "Validation columns",
+                    options=all_cols,
+                    default=S.val_cols,
+                    key="adj_val_cols",
+                )
+                adj_explore = st.multiselect(
+                    "Exploration columns",
+                    options=all_cols,
+                    default=S.explore_cols,
+                    key="adj_explore_cols",
+                )
+
+                # GT linkage for any validation columns present
+                if adj_val and S.gt_cols:
+                    st.caption("GT linkage")
+                    adj_gt_map: dict[str, list[str]] = {}
+                    for vc in adj_val:
+                        prev = _as_list(S.col_gt_map.get(vc))
+                        chosen = st.multiselect(
+                            f"{vc} →",
+                            options=S.gt_cols,
+                            default=[c for c in prev if c in S.gt_cols],
+                            key=f"adj_gt_{vc}",
+                        )
+                        if chosen:
+                            adj_gt_map[vc] = chosen
+
+                if st.button("✓ Apply changes", key="adj_apply", type="primary"):
+                    added   = [vc for vc in adj_val   if vc not in S.val_cols]
+                    removed = [vc for vc in S.val_cols if vc not in adj_val]
+
+                    # Remove pending queue items for dropped columns (keep results)
+                    if removed:
+                        S.queue = [(r, c) for r, c in S.queue if c not in removed]
+
+                    # Append queue items for new columns (unreviewed rows only)
+                    if added:
+                        reviewed = set(S.results.keys())
+                        new_items = [
+                            (row_idx, vc)
+                            for vc in added
+                            for row_idx in S.df.index
+                            if (row_idx, vc) not in reviewed
+                        ]
+                        S.queue.extend(new_items)
+                        for vc in added:
+                            S.col_metric_mode.setdefault(vc, "categorical")
+                            S.multi_hl_active.setdefault(vc, True)
+
+                    S.val_cols    = list(adj_val)
+                    S.explore_cols = list(adj_explore)
+                    if adj_val and S.gt_cols:
+                        S.col_gt_map = adj_gt_map
+                    save_project()
+                    st.success(
+                        f"Applied — {len(added)} col(s) added, "
+                        f"{len(removed)} removed, "
+                        f"{len(S.queue)} items in queue."
+                    )
+                    st.rerun()
+
         if S.results:
             st.markdown("---\n**Progress by column:**")
             # In multi-col mode every queue entry covers all val_cols for one row
@@ -1305,14 +1401,22 @@ def page_validate():
         pos_class   = None
         model_val   = ""
         # Reverse of col_gt_map: for each GT col, what model value should be
-        # highlighted in it?  Built so each GT col is highlighted with the
-        # model value from its linked validation column.
-        gt_highlight_map: dict[str, str] = {}
+        # Assign each val_col a distinct highlight color; init toggle state
+        val_col_color = {vc: _HL_PALETTE[i % len(_HL_PALETTE)]
+                         for i, vc in enumerate(S.val_cols)}
         for vc in S.val_cols:
-            mv = str(row.get(vc, "")) if vc in row.index else ""
+            if vc not in S.multi_hl_active:
+                S.multi_hl_active[vc] = True
+
+        # Reverse map: gt_col → [(model_val, color), ...] for active toggles only
+        gt_highlight_map: dict[str, list[tuple[str, str]]] = {}
+        for vc in S.val_cols:
+            if not S.multi_hl_active.get(vc, True):
+                continue
+            mv    = str(row.get(vc, "")) if vc in row.index else ""
+            color = val_col_color[vc]
             for gc in _as_list(S.col_gt_map.get(vc)):
-                if gc not in gt_highlight_map:   # first linked val_col wins
-                    gt_highlight_map[gc] = mv
+                gt_highlight_map.setdefault(gc, []).append((mv, color))
 
         # Auto-default: pre-fill all columns as "correct" when first arriving
         # at a row. Reviewer only needs to flip the incorrect ones.
@@ -1346,21 +1450,30 @@ def page_validate():
         for c in S.gt_cols:
             is_linked = c in linked_gts
             if is_multi:
-                hval = gt_highlight_map.get(c)   # per-column model value
+                _render_value(
+                    f"{c}  ✦ compare" if is_linked else c,
+                    row.get(c, "—"),
+                    "linked-gt-box" if is_linked else "gt-box",
+                    f"gt_{c}_{pos}",
+                    highlight_items=gt_highlight_map.get(c) or None,
+                )
             else:
-                hval = model_val if is_linked else None
-            _render_value(
-                f"{c}  ✦ compare" if is_linked else c,
-                row.get(c, "—"),
-                "linked-gt-box" if is_linked else "gt-box",
-                f"gt_{c}_{pos}",
-                highlight_val=hval,
-            )
+                _render_value(
+                    f"{c}  ✦ compare" if is_linked else c,
+                    row.get(c, "—"),
+                    "linked-gt-box" if is_linked else "gt-box",
+                    f"gt_{c}_{pos}",
+                    highlight_val=model_val if is_linked else None,
+                )
         for gc in [g for g in linked_gts if g not in S.gt_cols]:
-            hval = gt_highlight_map.get(gc) if is_multi else model_val
-            _render_value(f"{gc}  ✦ compare", row.get(gc, "—"),
-                          "linked-gt-box", f"lgt_{gc}_{pos}",
-                          highlight_val=hval)
+            if is_multi:
+                _render_value(f"{gc}  ✦ compare", row.get(gc, "—"),
+                              "linked-gt-box", f"lgt_{gc}_{pos}",
+                              highlight_items=gt_highlight_map.get(gc) or None)
+            else:
+                _render_value(f"{gc}  ✦ compare", row.get(gc, "—"),
+                              "linked-gt-box", f"lgt_{gc}_{pos}",
+                              highlight_val=model_val)
 
         if S.explore_visible and S.explore_cols:
             st.markdown("---")
@@ -1485,11 +1598,13 @@ def page_validate():
 
             # One compact row per validation column
             for vc in S.val_cols:
-                mv = str(row.get(vc, "—")) if vc in row.index else "—"
-                vc_res = S.results.get((row_idx, vc))
-                cur_v  = vc_res["verdict"] if vc_res else None
-                mm     = S.col_metric_mode.get(vc, "categorical")
-                pc     = S.col_positive_class.get(vc, "True")
+                mv      = str(row.get(vc, "—")) if vc in row.index else "—"
+                vc_res  = S.results.get((row_idx, vc))
+                cur_v   = vc_res["verdict"] if vc_res else None
+                mm      = S.col_metric_mode.get(vc, "categorical")
+                pc      = S.col_positive_class.get(vc, "True")
+                color   = val_col_color[vc]
+                hl_on   = S.multi_hl_active.get(vc, True)
 
                 badge_html = (
                     f'<span style="background:#d4edda;color:#155724;padding:1px 5px;'
@@ -1505,21 +1620,40 @@ def page_validate():
                 else:
                     status_html = '<span style="color:#bbb;font-size:1.3em">·</span>'
 
-                ci, cy, cn, cs = st.columns([5, 1, 1, 0.6])
+                # Color swatch — filled when highlight on, hollow when off
+                swatch = (
+                    f'<span style="color:{color};font-size:1.1em" '
+                    f'title="Highlight color for {vc}">■</span>'
+                    if hl_on else
+                    f'<span style="color:#ccc;font-size:1.1em" '
+                    f'title="Highlighting off for {vc}">■</span>'
+                )
+
+                ci, cht, cy, cn, cs = st.columns([4.5, 0.7, 1, 1, 0.6])
                 with ci:
                     st.markdown(
                         f'<div style="font-weight:600;font-size:0.9em">'
-                        f'`{vc}` &nbsp;{badge_html}</div>',
+                        f'{swatch} `{vc}` &nbsp;{badge_html}</div>',
                         unsafe_allow_html=True,
                     )
                     mv_esc = _html.escape(mv)
                     st.markdown(
-                        f'<div style="background:#fff8e1;border-left:3px solid #ffc107;'
+                        f'<div style="background:#fff8e1;border-left:3px solid {color};'
                         f'padding:4px 8px;border-radius:4px;font-size:0.9em;'
                         f'max-height:72px;overflow-y:auto;white-space:pre-wrap;">'
                         f'{mv_esc}</div>',
                         unsafe_allow_html=True,
                     )
+                with cht:
+                    st.markdown('<div style="height:1.4rem"></div>', unsafe_allow_html=True)
+                    if st.button(
+                        "🔍" if hl_on else "○",
+                        key=f"mc_hl_{vc}_{pos}",
+                        use_container_width=True,
+                        help="Toggle highlight in GT boxes",
+                    ):
+                        S.multi_hl_active[vc] = not hl_on
+                        st.rerun()
                 with cy:
                     st.markdown('<div style="height:1.4rem"></div>', unsafe_allow_html=True)
                     if st.button("✓", key=f"mc_yes_{vc}_{pos}",
